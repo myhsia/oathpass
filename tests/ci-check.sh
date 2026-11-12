@@ -21,7 +21,7 @@ mkdir -p "$HOME/.config/oathpass"
 SEED="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNA="
 
 cat >"$TMP/valid.json" <<EOF
-{"oathpass": {"host": "127.0.0.1", "ports": ["1", "2", "3"], "user": "ci", "mail_domain": "example.org",
+{"oathpass": {"host": "127.0.0.1", "ports": ["1", "2", "3"], "user": "ci",
   "otp": {"uri": "otpauth://totp/ci?secret=$SEED&algorithm=SHA512&digits=8&period=30"}}}
 EOF
 
