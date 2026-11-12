@@ -66,7 +66,6 @@
 #include <netdb.h>
 #include <poll.h>
 #include <stdarg.h>
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -759,13 +758,6 @@ static void fresh_code(const Token *tok, char *out, size_t outsz) {
 /* ---------------------------------------------------------------- the config */
 
 typedef struct {
-    char name[64];
-    double rate;    /* currency per core-hour */
-    int cores;      /* capacity of the allocation */
-    int min_cores;  /* smallest job the partition accepts */
-} Partition;
-
-typedef struct {
     char host[256];
     char user[256];
     char password[256];
@@ -774,9 +766,6 @@ typedef struct {
     int ports[16];
     size_t nports;
     char ports_render[128];
-    Partition partitions[16];
-    size_t npartitions;
-    double spend_limit;
 } Config;
 
 static int is_placeholder(const char *s) {
@@ -852,8 +841,6 @@ static void parse_otpauth(const char *uri, Token *tok, char *secret, size_t secr
     free(copy);
 }
 
-static void load_partitions(const JVal *block, Config *cfg);
-
 static void load_config(Config *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->token.digits = 8;
@@ -915,8 +902,6 @@ static void load_config(Config *cfg) {
     JVal *time_url = jget(block, "time_url");
     if (time_url && time_url->type == J_STR && time_url->str[0] && !is_placeholder(time_url->str))
         snprintf(g_time_url, sizeof g_time_url, "%s", time_url->str);
-
-    load_partitions(block, cfg);
 
     JVal *otp = jget(block, "otp");
     if (!otp) die("oathpass.otp is missing in %s", path);
@@ -1457,199 +1442,6 @@ static char *single_quote(const char *text) {
     return out;
 }
 
-/* ------------------------------------------------------------------- money
- * Slurm bills allocated cores per started hour, so cost = cores x rate x
- * ceil(hours).  The table below is the published one; a "partitions" object in
- * the config overrides it entry by entry, which is how a group's own rates or
- * capacities get in.
- */
-
-/* intel-sc3-32c cancelled a one-core job with "CANCELLED by 0" (the
-   administrator) and completed the same job on intel-sc3, measured 2026-11-12;
-   its minimum is taken to be the 32 cores of its name. */
-static const Partition builtin_partitions[] = {
-    {"intel-sc3-32c", 0.02, 64, 32},
-    {"amd-ep5-first", 0.03, 256, 1},
-    {"intel-sc3", 0.02, 64, 1},
-    {"amd-ep5", 0.03, 256, 1},
-    {"intel-fat", 0.15, 96, 1},
-    {"a100-40g", 3.00, 64, 1},
-};
-
-typedef struct {
-    const Partition *part;
-    double wall_h;
-    int billed_h;
-    double cost;
-    int cores; /* cores actually requested */
-} Plan;
-
-static void load_partitions(const JVal *block, Config *cfg) {
-    cfg->npartitions = 0;
-    for (size_t i = 0; i < sizeof builtin_partitions / sizeof builtin_partitions[0]; i++)
-        cfg->partitions[cfg->npartitions++] = builtin_partitions[i];
-    cfg->spend_limit = 7.80;
-
-    JVal *limit = jget(block, "spend_limit");
-    if (limit && limit->type == J_NUM && limit->num > 0) cfg->spend_limit = limit->num;
-
-    JVal *table = jget(block, "partitions");
-    if (!table || table->type != J_OBJ) return;
-    for (size_t i = 0; i < table->count; i++) {
-        JVal *entry = table->items[i];
-        if (entry->type != J_OBJ) continue;
-        JVal *rate = jget(entry, "rate");
-        JVal *cores = jget(entry, "cores");
-        JVal *min_cores = jget(entry, "min_cores");
-        if (!rate || rate->type != J_NUM || !cores || cores->type != J_NUM) continue;
-        Partition *slot = NULL;
-        for (size_t k = 0; k < cfg->npartitions; k++)
-            if (!strcmp(cfg->partitions[k].name, table->keys[i])) slot = &cfg->partitions[k];
-        if (!slot) {
-            if (cfg->npartitions >= sizeof cfg->partitions / sizeof cfg->partitions[0]) continue;
-            slot = &cfg->partitions[cfg->npartitions++];
-            snprintf(slot->name, sizeof slot->name, "%s", table->keys[i]);
-        }
-        slot->rate = rate->num;
-        slot->cores = (int)cores->num;
-        if (min_cores && min_cores->type == J_NUM) slot->min_cores = (int)min_cores->num;
-    }
-}
-
-/* "HH:MM:SS", "MM:SS", or a bare number of minutes. */
-static int parse_time(const char *text, double *hours) {
-    int h = 0, m = 0, sec = 0;
-    if (sscanf(text, "%d:%d:%d", &h, &m, &sec) == 3) {
-        *hours = h + m / 60.0 + sec / 3600.0;
-        return *hours > 0;
-    }
-    if (sscanf(text, "%d:%d", &m, &sec) == 2) {
-        *hours = m / 60.0 + sec / 3600.0;
-        return *hours > 0;
-    }
-    if (sscanf(text, "%d", &m) == 1) {
-        *hours = m / 60.0;
-        return *hours > 0;
-    }
-    return 0;
-}
-
-/* The job does `cores` core-hours of work per `hours` of wall time at
-   efficiency 1.0.  A partition with more capacity finishes sooner, and is
-   billed for the cores it actually allocates. */
-/* `cores` is the job's width; `max_cores` is how far it may scale up (the
-   partition capacity unless the caller caps it).  The two are separate so the
-   tool never quietly quadruples the request for a job that cannot use it. */
-static int plan_one(const Partition *part, int cores, int max_cores, double hours, double efficiency,
-                    Plan *out) {
-    if (cores < 1 || hours <= 0 || efficiency <= 0 || efficiency > 1) return 0;
-    if (part->cores < cores) return 0;          /* the allocation cannot hold the job */
-    if (cores < part->min_cores) return 0;      /* the partition rejects small jobs */
-    int usable = part->cores < max_cores ? part->cores : max_cores;
-    if (usable < cores) usable = cores;
-    double wall = hours * (double)cores / (double)usable / efficiency;
-    int billed = (int)ceil(wall - 1e-9);
-    if (billed < 1) billed = 1;
-    out->part = part;
-    out->wall_h = wall;
-    out->billed_h = billed;
-    out->cost = part->rate * (double)usable * (double)billed;
-    out->cores = usable;
-    return 1;
-}
-
-static size_t plan_all(const Config *cfg, int cores, int max_cores, double hours, double efficiency,
-                       Plan *out, size_t max) {
-    size_t n = 0;
-    for (size_t i = 0; i < cfg->npartitions && n < max; i++)
-        if (plan_one(&cfg->partitions[i], cores, max_cores, hours, efficiency, &out[n])) n++;
-    return n;
-}
-
-static int plan_cheapest(Plan *plans, size_t n) {
-    int best = -1;
-    for (size_t i = 0; i < n; i++)
-        if (best < 0 || plans[i].cost < plans[best].cost) best = (int)i;
-    return best;
-}
-
-/* Fastest plan that stays within the cap; ties in cost (within five fen) go to
-   the faster one.  -1 when nothing fits. */
-static int plan_fastest_within(Plan *plans, size_t n, double limit) {
-    int best = -1;
-    for (size_t i = 0; i < n; i++) {
-        if (plans[i].cost > limit + 1e-9) continue;
-        if (best < 0 || plans[i].wall_h < plans[best].wall_h - 1e-9 ||
-            (fabs(plans[i].wall_h - plans[best].wall_h) < 1e-9 &&
-             plans[i].cost < plans[best].cost))
-            best = (int)i;
-    }
-    return best;
-}
-
-static const char *part_name(const Plan *p) { return p->part->name; }
-
-static void print_money_table(const Plan *plans, size_t n, int chosen, int cheapest) {
-    printf("%-16s %6s %8s %9s %8s %9s\n", "partition", "cores", "rate", "wall", "billed", "cost");
-    for (size_t i = 0; i < n; i++) {
-        int h = (int)plans[i].wall_h;
-        int m = (int)((plans[i].wall_h - h) * 60.0 + 0.5);
-        if (m == 60) {
-            h++;
-            m = 0;
-        }
-        printf("%-16s %6d %8.3f %6dh%02dm %6dh %9.2f%s%s\n", part_name(&plans[i]), plans[i].cores,
-               plans[i].part->rate, h, m, plans[i].billed_h, plans[i].cost,
-               (int)i == chosen ? "  <-" : "", (int)i == cheapest ? " (cheapest)" : "");
-    }
-}
-
-static int cmd_cost(const Config *cfg, int argc, char **argv) {
-    int cores = 0, max_cores = 0;
-    double hours = 0, efficiency = 1.0, budget = cfg->spend_limit;
-    for (int i = 0; i < argc; i++) {
-        if (!strcmp(argv[i], "-c") && i + 1 < argc) cores = atoi(argv[++i]);
-        else if (!strncmp(argv[i], "--cores=", 8)) cores = atoi(argv[i] + 8);
-        else if (!strcmp(argv[i], "--time") && i + 1 < argc) {
-            if (!parse_time(argv[++i], &hours)) die("--time must be HH:MM:SS, MM:SS or minutes");
-        } else if (!strcmp(argv[i], "--max-cores") && i + 1 < argc) max_cores = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--efficiency") && i + 1 < argc) efficiency = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = atof(argv[++i]);
-        else die("cost takes -c N --time T [--max-cores N] [--efficiency E] [--budget Y]");
-    }
-    if (cores < 1) die("cost needs -c N");
-    if (hours <= 0) die("cost needs --time HH:MM:SS");
-    if (max_cores < cores) max_cores = 256; /* default: the partition may scale the job */
-
-    Plan plans[16];
-    size_t n = plan_all(cfg, cores, max_cores, hours, efficiency, plans, 16);
-    if (!n) die("no partition can hold %d cores", cores);
-
-    int cheapest = plan_cheapest(plans, n);
-    int chosen = plan_fastest_within(plans, n, budget);
-    int over = 0;
-    if (chosen < 0) {
-        chosen = cheapest;
-        over = 1;
-    }
-    printf("job        %d cores, up to %.2fh, efficiency %.2f\n\n", cores, hours, efficiency);
-    print_money_table(plans, n, chosen, cheapest);
-    printf("\n");
-    if (over)
-        printf("plan       %s  %.2f  (nothing fits the %.2f cap; cheapest shown)\n",
-               part_name(&plans[chosen]), plans[chosen].cost, budget);
-    else
-        printf("plan       %s  %.2f  (fastest within the %.2f cap)\n", part_name(&plans[chosen]),
-               plans[chosen].cost, budget);
-    if (chosen != cheapest) {
-        double saving = plans[chosen].cost - plans[cheapest].cost;
-        double slower = plans[cheapest].wall_h - plans[chosen].wall_h;
-        printf("cheaper    %s  %.2f  (%.1fh slower, saves %.2f)\n", part_name(&plans[cheapest]),
-               plans[cheapest].cost, slower, saving);
-    }
-    return 0;
-}
-
 static int cmd_run(const Config *cfg, int forced_index, int forced_port, int argc, char **argv) {
     if (argc < 1) die("run needs a command, e.g. oathpass run ls -la");
     if (!command_allowed(argv[0]))
@@ -2005,14 +1797,31 @@ static int job_id_ok(const char *id) {
     return 1;
 }
 
+/* "HH:MM:SS", "MM:SS", or a bare number of minutes. */
+static int parse_time(const char *text, double *hours) {
+    int h = 0, m = 0, sec = 0;
+    if (sscanf(text, "%d:%d:%d", &h, &m, &sec) == 3) {
+        *hours = h + m / 60.0 + sec / 3600.0;
+        return *hours > 0;
+    }
+    if (sscanf(text, "%d:%d", &m, &sec) == 2) {
+        *hours = m / 60.0 + sec / 3600.0;
+        return *hours > 0;
+    }
+    if (sscanf(text, "%d", &m) == 1) {
+        *hours = m / 60.0;
+        return *hours > 0;
+    }
+    return 0;
+}
+
 static int cmd_job(const Config *cfg, int forced_index, int forced_port, int argc, char **argv) {
     if (argc < 1) die("job needs submit, list, show, log, cancel or shell");
 
     const char *sub = argv[0];
-    int cores = 0, max_cores = 0;
-    double hours = 0, efficiency = 1.0;
+    int cores = 1;
+    double hours = 0;
     const char *script = NULL, *partition = NULL, *qos = NULL, *mem = NULL;
-    int cheap = 0, assume_yes = 0;
 
     if (!strcmp(sub, "list")) {
         char sock[CONTROL_PATH_MAX];
@@ -2045,7 +1854,6 @@ static int cmd_job(const Config *cfg, int forced_index, int forced_port, int arg
     if (strcmp(sub, "submit") && strcmp(sub, "shell"))
         die("unknown job command '%s'", sub);
 
-    /* ---- planning happens before any connection ---- */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) cores = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--time") && i + 1 < argc) {
@@ -2053,50 +1861,18 @@ static int cmd_job(const Config *cfg, int forced_index, int forced_port, int arg
         } else if (!strcmp(argv[i], "-p") && i + 1 < argc) partition = argv[++i];
         else if (!strcmp(argv[i], "-q") && i + 1 < argc) qos = argv[++i];
         else if (!strcmp(argv[i], "--mem") && i + 1 < argc) mem = argv[++i];
-        else if (!strcmp(argv[i], "--max-cores") && i + 1 < argc) max_cores = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--efficiency") && i + 1 < argc) efficiency = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--cheap")) cheap = 1;
-        else if (!strcmp(argv[i], "--yes")) assume_yes = 1;
         else if (argv[i][0] == '-') die("unknown option '%s'", argv[i]);
         else script = argv[i];
     }
     if (hours <= 0) die("--time is required: no job is submitted without a wall-clock limit");
+    if (!partition)
+        die("-p PARTITION is required: price the job first (hpc-job cost) and pass the partition");
+    if (cores < 1) die("-c must be at least 1");
     if (!strcmp(sub, "submit") && !script) die("job submit needs a script");
-    if (cores < 1) cores = 1;
-    if (max_cores < cores) max_cores = 256;
 
-    Plan plans[16];
-    size_t n = 0;
-    if (partition) {
-        const Partition *wanted = NULL;
-        for (size_t i = 0; i < cfg->npartitions; i++)
-            if (!strcmp(cfg->partitions[i].name, partition)) wanted = &cfg->partitions[i];
-        if (!wanted) die("unknown partition '%s'", partition);
-        if (!plan_one(wanted, cores, max_cores, hours, efficiency, &plans[0]))
-            die("%s cannot hold %d cores", partition, cores);
-        n = 1;
-    } else {
-        n = plan_all(cfg, cores, max_cores, hours, efficiency, plans, 16);
-        if (!n) die("no partition can hold %d cores", cores);
-    }
-
-    int cheapest = plan_cheapest(plans, n);
-    int chosen = cheap ? cheapest : plan_fastest_within(plans, n, cfg->spend_limit);
-    int over = chosen < 0;
-    if (over) chosen = cheapest;
-
-    print_money_table(plans, n, chosen, cheapest);
-    printf("plan       %s  %d cores  %.2f%s\n", part_name(&plans[chosen]), plans[chosen].cores,
-           plans[chosen].cost, over ? "  (over the cap)" : "");
-    if (plans[chosen].cores > cores)
-        printf("scaling    the job is measured at %d cores; %d are requested -- "
-               "pass --max-cores %d if it does not scale\n",
-               cores, plans[chosen].cores, cores);
-    if (over && !assume_yes)
-        die("the cheapest plan is %.2f, above the %.2f cap -- pass --yes to accept it",
-            plans[chosen].cost, cfg->spend_limit);
-    if (plans[chosen].cost > cfg->spend_limit && !assume_yes)
-        die("%.2f exceeds the %.2f cap -- pass --yes", plans[chosen].cost, cfg->spend_limit);
+    char wall[32];
+    long total = (long)(hours * 3600.0 + 0.5);
+    snprintf(wall, sizeof wall, "%02ld:%02ld:%02ld", total / 3600, (total / 60) % 60, total % 60);
 
     char sock[CONTROL_PATH_MAX];
     int port = 0;
@@ -2104,13 +1880,9 @@ static int cmd_job(const Config *cfg, int forced_index, int forced_port, int arg
     if (rc) return rc;
 
     if (!strcmp(sub, "shell")) {
-        /* srun takes the wall time as HH:MM:SS */
         char remote[1024];
-        char wall[32];
-        int total = (int)ceil(hours * 3600.0);
-        snprintf(wall, sizeof wall, "%02d:%02d:%02d", total / 3600, (total / 60) % 60, total % 60);
         snprintf(remote, sizeof remote, "srun --pty --time=%s -c %d -p %s%s%s bash", wall, cores,
-                 part_name(&plans[chosen]), qos ? " -q " : "", qos ? qos : "");
+                 partition, qos ? " -q " : "", qos ? qos : "");
         return run_remote(cfg, sock, port, remote, NULL, NULL, 0);
     }
 
@@ -2126,16 +1898,11 @@ static int cmd_job(const Config *cfg, int forced_index, int forced_port, int arg
     fclose(fp);
     if (rc != 0) return rc;
 
-    char wall[32];
-    int total = (int)ceil(hours * 3600.0);
-    snprintf(wall, sizeof wall, "%02d:%02d:%02d", total / 3600, (total / 60) % 60, total % 60);
-
     char output[256];
     snprintf(remote, sizeof remote,
-             "sbatch --parsable -o jobs/slurm-%%j.out -J %.40s -p %s -c %d -t %s%s%s%s%s "
-             "jobs/%s",
-             base, part_name(&plans[chosen]), plans[chosen].cores, wall, qos ? " -q " : "",
-             qos ? qos : "", mem ? " --mem=" : "", mem ? mem : "", base);
+             "sbatch --parsable -o jobs/slurm-%%j.out -J %.40s -p %s -c %d -t %s%s%s%s%s jobs/%s", base,
+             partition, cores, wall, qos ? " -q " : "", qos ? qos : "", mem ? " --mem=" : "",
+             mem ? mem : "", base);
     rc = run_remote(cfg, sock, port, remote, NULL, output, sizeof output);
     if (rc != 0) return rc;
 
@@ -2145,9 +1912,7 @@ static int cmd_job(const Config *cfg, int forced_index, int forced_port, int arg
     if (semi) *semi = '\0';
     if (!job_id_ok(output)) die("sbatch did not return a job id (got '%s')", output);
 
-    printf("\nsubmitted  job %s  on %s, %d cores, wall %s\n", output, part_name(&plans[chosen]),
-           plans[chosen].cores, wall);
-    printf("estimate   %.2f   (billed %dh)\n", plans[chosen].cost, plans[chosen].billed_h);
+    printf("\nsubmitted  job %s  on %s, %d cores, wall %s\n", output, partition, cores, wall);
     printf("watch      oathpass job show %s   /   oathpass job log %s\n", output, output);
     printf("cancel     oathpass job cancel %s\n", output);
     return 0;
@@ -2759,6 +2524,9 @@ static int usage(void) {
            "       oathpass status               node, master state, socket\n"
            "       oathpass sockpath             print the socket, for rsync -e\n"
            "       oathpass close                drop the shared connection\n"
+           "       oathpass job submit -p P -c N --time T SCRIPT\n"
+           "                                     Slurm submit; price it first (hpc-job cost)\n"
+           "       oathpass job list|show ID|log ID|cancel ID|shell\n"
            "       oathpass check                dry run: node, code, nothing sent\n"
            "       oathpass otp [--at EPOCH]     print the current code\n"
            "       oathpass port                 print the login port in use\n"
@@ -2824,7 +2592,7 @@ int main(int argc, char **argv) {
 
     static const char *const with_config[] = {
         "otp", "target", "doctor", "wrap", "port", "check", "--dry-run",
-        "run", "sftp", "scp",  "rsync", "status", "sockpath", "close", "cost", "job", NULL};
+        "run", "sftp", "scp", "rsync", "status", "sockpath", "close", "job", NULL};
     int known = 0;
     for (size_t i = 0; with_config[i]; i++)
         if (!strcmp(command, with_config[i])) known = 1;
@@ -2845,7 +2613,6 @@ int main(int argc, char **argv) {
         if (!strcmp(command, "status")) return cmd_status(&cfg, forced_node, forced_port);
         if (!strcmp(command, "sockpath")) return cmd_sockpath(&cfg, forced_node, forced_port);
         if (!strcmp(command, "close")) return cmd_close(&cfg, forced_port);
-        if (!strcmp(command, "cost")) return cmd_cost(&cfg, restc - 1, rest + 1);
         if (!strcmp(command, "job")) return cmd_job(&cfg, forced_node, forced_port, restc - 1, rest + 1);
         return cmd_wrap(&cfg, restc - 1, rest + 1);
     }
