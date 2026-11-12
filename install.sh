@@ -51,6 +51,14 @@ detect_target() {
         *) die "no released binary for $os-$arch; build from source with make" ;;
     esac
     TARGET="${os}-${arch}"
+    # macOS gets one universal asset: under Rosetta uname reports x86_64 on an
+    # arm64 Mac, so a per-arch choice there would be a guess.  Older releases
+    # carry the two slices separately, hence the fallback.
+    if [ "$os" = "macos" ]; then
+        TARGETS="macos-universal macos-${arch}"
+    else
+        TARGETS="$TARGET"
+    fi
 }
 
 latest_version() {
@@ -77,23 +85,31 @@ detect_target
 [ -n "$VERSION" ] || VERSION="$(latest_version)"
 [ -n "$VERSION" ] || die "cannot determine the latest release; pass --version"
 
-case "$TARGET" in
-    windows-*) asset="oathpass-${VERSION}-${TARGET}.exe" ;;
-    *) asset="oathpass-${VERSION}-${TARGET}" ;;
-esac
 destination="${PREFIX}/oathpass"
 [ "$TARGET" = "windows-amd64" ] && destination="${PREFIX}/oathpass.exe"
 
-echo "target   ${TARGET}"
+echo "target   ${TARGETS%% *}"
 echo "release  v${VERSION}"
-echo "asset    ${asset}"
 echo "install  ${destination}"
 [ "$DRY_RUN" -eq 1 ] && exit 0
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-fetch "$asset" "$tmp" || die "cannot download ${asset} (does the release exist?)"
+downloaded=0
+for candidate in $TARGETS; do
+    case "$candidate" in
+        windows-*) name="oathpass-${VERSION}-${candidate}.exe" ;;
+        *) name="oathpass-${VERSION}-${candidate}" ;;
+    esac
+    if fetch "$name" "$tmp"; then
+        asset="$name"
+        downloaded=1
+        break
+    fi
+done
+[ "$downloaded" -eq 1 ] || die "cannot download ${VERSION}: no asset for ${TARGETS} (does that release exist?)"
+echo "asset    ${asset}"
 fetch SHA256SUMS "$tmp" || die "cannot download SHA256SUMS for v${VERSION}"
 
 if command -v sha256sum >/dev/null 2>&1; then

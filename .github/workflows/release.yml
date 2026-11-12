@@ -83,45 +83,64 @@ jobs:
           path: dist/*
 
   macos:
-    name: macos-${{ matrix.arch }}
+    name: macos
     needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            ccflags: ""
-          - arch: amd64
-            ccflags: "-arch x86_64"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build
-        run: make CFLAGS="-O2 -Wall -Wextra -Werror ${{ matrix.ccflags }}"
-
-      - name: Selftest
+      # Rosetta is what makes the x86 slice a tested artefact rather than a
+      # compiled file, so install it before either build.
+      - name: Rosetta
         run: |
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            # Rosetta is what makes the x86 build a tested artefact rather than
-            # a compiled file, so install it or fail.
-            if ! /usr/bin/pgrep -q oahd; then
-              sudo softwareupdate --install-rosetta --agree-to-license
-            fi
-            arch -x86_64 ./oathpass --selftest
-          else
-            ./oathpass --selftest
+          if ! /usr/bin/pgrep -q oahd; then
+            sudo softwareupdate --install-rosetta --agree-to-license
           fi
+
+      - name: Build arm64
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror" && cp oathpass oathpass-arm64
+
+      - name: Build amd64
+        run: |
+          make clean
+          make CFLAGS="-O2 -Wall -Wextra -Werror -arch x86_64"
+          cp oathpass oathpass-amd64
+
+      - name: Selftest each slice where it runs natively
+        run: |
+          ./oathpass-arm64 --selftest
+          arch -x86_64 ./oathpass-amd64 --selftest
+
+      # One Mach-O with both slices: the installer then never has to decide
+      # whether this Mac is really arm64 (uname -m reports x86_64 under
+      # Rosetta, which is how a universal asset earns its place).
+      - name: Universal
+        run: |
+          lipo -create -output oathpass-universal oathpass-arm64 oathpass-amd64
+          lipo -info oathpass-universal
+          for arch_name in arm64 x86_64; do
+            if ! lipo -info oathpass-universal | grep -qw "$arch_name"; then
+              echo "the universal binary lacks the $arch_name slice" >&2
+              exit 1
+            fi
+          done
+
+      - name: Selftest the universal binary both ways
+        run: |
+          ./oathpass-universal --selftest
+          arch -x86_64 ./oathpass-universal --selftest
 
       - name: Package
         run: |
           version="$(cat VERSION)"
           mkdir -p dist
-          cp oathpass "dist/oathpass-${version}-macos-${{ matrix.arch }}"
+          cp oathpass-universal "dist/oathpass-${version}-macos-universal"
+          cp oathpass-arm64     "dist/oathpass-${version}-macos-arm64"
+          cp oathpass-amd64     "dist/oathpass-${version}-macos-amd64"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}
+          name: macos
           path: dist/*
 
   windows:

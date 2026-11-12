@@ -48,7 +48,12 @@ The five targets, and how each is proven:
 | linux-arm64 | `zig cc` aarch64-musl, static | `qemu-aarch64-static` |
 | macos-arm64 | native | native |
 | macos-amd64 | `-arch x86_64` | `arch -x86_64` under Rosetta |
+| macos-universal | `lipo -create` of both | both slices, natively and under Rosetta |
 | windows-amd64 | MSYS2 `gcc` | native |
+
+`macos-universal` is the asset the installer prefers on macOS: `uname -m` reports `x86_64` on an
+arm64 Mac whenever the shell is running under Rosetta, so a per-arch choice there would be a guess.
+The two per-arch slices are still published for pinned and embedded use.
 
 A target is released only if its binary *ran* the selftest. `windows-arm64` is
 not released: MSYS2 has no Cygwin layer for it, so the source would need a native
