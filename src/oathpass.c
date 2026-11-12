@@ -43,6 +43,7 @@
  *   oathpass status|close    master state, and dropping it
  *   oathpass doctor          diagnose a code that does not match the phone
  *   oathpass --selftest      replay the RFC 6238 vectors, no config needed
+ *   oathpass --version       print the version
  *
  * The configured ports are equivalent entry points: the listed order is tried
  * and a dead one falls through to the next.  Authentication is different -- a
@@ -87,6 +88,10 @@
 #define MIN_REMAINING 4.0        /* answer only this far into a window */
 #define MAX_AUTH_ATTEMPTS 3      /* lockout budget, global across ports */
 #define TAIL_MAX 8192
+#ifndef OATHPASS_VERSION
+#define OATHPASS_VERSION "unknown"
+#endif
+
 #define CONTROL_PATH_MAX 4096
 
 /* Any HTTPS host returns a Date header; override with "time_url" in the config. */
@@ -2338,6 +2343,7 @@ static int usage(void) {
            "       oathpass doctor               why a code does not match the phone\n"
            "       oathpass --selftest           replay the RFC 6238 vectors\n"
            "       oathpass --init [--force]     guided set-up of the config file\n"
+           "       oathpass --version            print the version\n"
            "\n"
            "One code opens a multiplexed master connection; later commands, sftp\n"
            "and scp reuse it, because the code is single-use.  The seed comes from\n"
@@ -2384,6 +2390,10 @@ int main(int argc, char **argv) {
     int restc = argc - index;
     const char *command = restc > 0 ? rest[0] : "";
 
+    if (!strcmp(command, "--version") || !strcmp(command, "-V")) {
+        printf("oathpass %s\n", OATHPASS_VERSION);
+        return 0;
+    }
     if (!strcmp(command, "--help") || !strcmp(command, "-h") || !strcmp(command, "help")) return usage();
     if (!strcmp(command, "--selftest") || !strcmp(command, "selftest")) return cmd_selftest();
     if (!strcmp(command, "--init") || !strcmp(command, "init"))

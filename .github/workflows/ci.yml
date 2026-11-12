@@ -22,7 +22,7 @@ jobs:
         run: make test
 
       - name: CLI checks
-        run: sh scripts/ci-check.sh ./oathpass
+        run: sh tests/ci-check.sh ./oathpass
 
       - name: Install to a prefix
         run: |
@@ -51,4 +51,4 @@ jobs:
 
       - name: CLI checks
         shell: msys2 {0}
-        run: sh scripts/ci-check.sh ./oathpass
+        run: sh tests/ci-check.sh ./oathpass

@@ -1,0 +1,112 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: tag matches VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          file="$(cat VERSION)"
+          if [ "$tag" != "$file" ]; then
+            echo "tag $GITHUB_REF_NAME does not match VERSION $file" >&2
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.os }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror"
+
+      - name: Selftest
+        run: ./oathpass --selftest
+
+      - name: Package
+        run: |
+          version="$(cat VERSION)"
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          asset="oathpass-${version}-${os}-$(uname -m)"
+          mkdir -p dist
+          cp oathpass "dist/${asset}"
+          chmod +x "dist/${asset}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}
+          path: dist/*
+
+  windows:
+    name: windows-latest (msys2)
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: false
+          install: gcc make
+
+      - name: Build
+        shell: msys2 {0}
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror"
+
+      - name: Selftest
+        shell: msys2 {0}
+        run: ./oathpass --selftest
+
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          version="$(cat VERSION)"
+          mkdir -p dist
+          cp oathpass "dist/oathpass-${version}-windows-msys2.exe"
+          printf 'This build needs the MSYS2 runtime (msys-2.0.dll).\nIt is provided for completeness; the supported targets are macOS and Linux.\n' > "dist/README-windows.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  publish:
+    name: publish
+    needs: [build, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in
+            *-*) flags="--prerelease" ;;
+          esac
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" $flags \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

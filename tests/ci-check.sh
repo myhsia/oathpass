@@ -5,7 +5,7 @@
 # The tool reads $HOME/.config/oathpass/config.json and nothing else, so this
 # script points HOME at a scratch tree -- it can never touch a real config.
 #
-# Usage: sh scripts/ci-check.sh [path-to-binary]
+# Usage: sh tests/ci-check.sh [path-to-binary]
 set -eu
 
 BIN=${1:-./oathpass}
@@ -172,7 +172,7 @@ fi
 # The hyphen guards let `opencode-hpc-update` through; this script is excluded
 # because it necessarily contains the pattern it searches for.
 if out=$(grep -nE '(^|[^A-Za-z-])hpc([^A-Za-z-]|$)' \
-    "$ROOT/scripts/oathpass.c" "$ROOT/Makefile" "$ROOT/README.md" 2>/dev/null); then
+    "$ROOT/src/oathpass.c" "$ROOT/Makefile" "$ROOT/README.md" 2>/dev/null); then
     bad "no stale command name in the sources" ""
     printf '%s\n' "$out" | sed 's/^/       /'
 else
