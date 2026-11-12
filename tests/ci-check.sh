@@ -107,6 +107,32 @@ expect 1 "rsync refuses .."            "$TMP/valid.json" rsync x :../y
 expect 1 "rsync refuses its own -e"    "$TMP/valid.json" rsync -e ssh x :y
 expect 1 "rsync refuses --rsync-path"  "$TMP/valid.json" rsync --rsync-path=rm x :y
 expect 3 "rsync with no network"       "$TMP/valid.json" rsync -a ./x :y
+
+# Money: the planner is arithmetic, so it is checked without a connection.
+expect 1 "job without --time"          "$TMP/valid.json" job submit -c 4 "$TMP/x.sh"
+expect 1 "job over the cap"            "$TMP/valid.json" job submit -c 64 --time 20:00:00 "$TMP/x.sh"
+expect 1 "job with an unknown partition" "$TMP/valid.json" job submit -c 1 --time 00:02:00 -p nowhere "$TMP/x.sh"
+expect 1 "cost without --time"         "$TMP/valid.json" cost -c 64
+
+use_config "$TMP/valid.json"
+cost=$("$BIN" cost -c 64 --time 04:00:00 2>&1)
+if printf '%s\n' "$cost" | grep -q 'intel-sc3-32c.*5.12'; then
+    ok "cost prices 64 cores on the cheap partition"
+else
+    bad "cost prices 64 cores on the cheap partition" "$(printf '%s' "$cost" | head -4)"
+fi
+if printf '%s\n' "$cost" | grep -q 'amd-ep5-first.*7.68.*<-'; then
+    ok "cost prefers the fast plan within the cap"
+else
+    bad "cost prefers the fast plan within the cap"
+fi
+# A one-core job must not be routed to the 32-core partition: the cluster
+# cancelled such a job with "CANCELLED by 0".
+if "$BIN" cost -c 1 --time 00:02:00 --max-cores 1 2>&1 | grep -q 'intel-sc3-32c'; then
+    bad "small jobs avoid the 32-core partition"
+else
+    ok "small jobs avoid the 32-core partition"
+fi
 expect 1 "sftp refuses interactive"    "$TMP/valid.json" sftp
 expect 3 "sftp accepts a valid batch"  "$TMP/valid.json" sftp -b "$TMP/batch-ok.txt"
 # A bad *second* line must be caught. If only the first line were validated

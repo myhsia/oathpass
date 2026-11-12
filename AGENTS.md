@@ -28,6 +28,15 @@ make install         # PREFIX/bin, default ~/.local/bin
 `-DOATHPASS_VERSION` and is never overridden, so a `make CFLAGS=…` still stamps
 the version.
 
+## Money
+
+Slurm bills allocated cores per started hour. `job submit` plans first, needs
+`--time`, and refuses above `spend_limit` (¥7.80) without `--yes`; the default
+pick is the fastest plan within the cap, `--cheap` takes the cheapest. Keep the
+partition table (`rate`, `cores`, `min_cores`) honest — the daily rate check in
+`~/.config/opencode/skills/opencode-hpc-update` compares it with the published
+page.
+
 ## Versioning and releasing
 
 1. Bump `VERSION`, commit.

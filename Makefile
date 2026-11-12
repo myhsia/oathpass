@@ -3,6 +3,7 @@
 CC      ?= cc
 VERSION ?= $(shell cat VERSION 2>/dev/null || echo unknown)
 DEFINES  = -DOATHPASS_VERSION='"$(VERSION)"'
+LDLIBS   = -lm
 CFLAGS  ?= -O2 -Wall -Wextra -Werror
 PREFIX  ?= $(HOME)/.local
 BINDIR  ?= $(PREFIX)/bin
@@ -13,7 +14,7 @@ BIN      = oathpass
 all: $(BIN)
 
 $(BIN): src/oathpass.c VERSION
-	$(CC) $(CFLAGS) $(DEFINES) -o $@ $<
+	$(CC) $(CFLAGS) $(DEFINES) -o $@ $< $(LDLIBS)
 
 # The build output is the command, so installing is one copy -- no interpreter,
 # no symlink, no bytecode cache.

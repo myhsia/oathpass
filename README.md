@@ -86,6 +86,8 @@ and never let an SFTP client save a code for the account.
 | `oathpass sftp -b FILE\|-` | batch sftp (interactive sftp is refused) |
 | `oathpass scp <args…>` | scp; `:path` means `<user>@<host>:path` |
 | `oathpass rsync <args…>` | rsync over the master, same path rules |
+| `oathpass job submit\|list\|show\|log\|cancel\|shell` | Slurm jobs, with the money planned first |
+| `oathpass cost -c N --time T` | price a job on every partition |
 | `oathpass check` | dry run: node, code, ssh line; nothing sent |
 | `oathpass otp [--at EPOCH]` | print the current code |
 | `oathpass port` / `target` | the chosen port / `user@host` |
@@ -95,6 +97,40 @@ and never let an SFTP client save a code for the account.
 | `oathpass --init [--force]` | guided set-up of the config |
 | `oathpass --selftest` | replay the RFC 6238 vectors |
 | `--node N` / `--port P` | pin one login node |
+
+## Jobs and money
+
+Slurm bills **allocated cores per started hour**: `cost = cores × rate ×
+ceil(hours)`, so a two-minute job costs a full core-hour and an over-sized
+request is charged even when idle.
+
+```console
+$ oathpass cost -c 64 --time 04:00:00
+partition         cores     rate      wall   billed      cost
+intel-sc3-32c        64    0.020      4h00m      4h      5.12 (cheapest)
+amd-ep5-first       256    0.030      1h00m      1h      7.68  <-
+...
+plan       amd-ep5-first  7.68  (fastest within the 7.80 cap)
+cheaper    intel-sc3-32c  5.12  (3.0h slower, saves 2.56)
+```
+
+- `job submit` picks the **fastest plan that fits the spend cap** (default
+  ¥7.80, `spend_limit` in the config); pass `--cheap` for the cheapest, or
+  `--yes` to accept a plan above the cap.
+- **`--time` is mandatory** — the cluster's default is no limit at all.
+- `-c` is the job's width and `--max-cores` caps how far it may scale; the tool
+  never silently multiplies the request.
+- Partitions carry `rate`, `cores` and `min_cores`; a partition that rejects
+  small jobs (this cluster's `intel-sc3-32c` cancels anything under 32 cores)
+  is never chosen for them.
+- `job shell` runs `srun --pty` under the same rules; `exit` releases it.
+
+Override the table per machine in `~/.config/oathpass/config.json`:
+
+```json
+"spend_limit": 7.80,
+"partitions": { "intel-sc3-32c": { "rate": 0.02, "cores": 64, "min_cores": 32 } }
+```
 
 ## What the guard is and is not
 
