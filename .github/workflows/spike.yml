@@ -35,6 +35,7 @@ jobs:
           ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no `
               -o NumberOfPasswordPrompts=1 -o ConnectTimeout=5 `
               -o StrictHostKeyChecking=no nobody@127.0.0.1 -p 65000 2>&1 | Write-Host
+          $global:LASTEXITCODE = 0
           Write-Host ("helper invoked: {0}" -f (Test-Path $marker))
 
       - name: Start a real sshd and see whether askpass answers it
@@ -53,5 +54,6 @@ jobs:
                      -o NumberOfPasswordPrompts=1 -o ConnectTimeout=5 `
                      -o StrictHostKeyChecking=no "$env:USERNAME@127.0.0.1" "echo hi" 2>&1
           $out | Write-Host
+          $global:LASTEXITCODE = 0
           Write-Host ("helper invoked: {0}" -f (Test-Path $marker))
           if (Test-Path $marker) { Write-Host ("marker content: " + (Get-Content $marker -Raw)) }
