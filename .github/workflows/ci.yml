@@ -24,6 +24,9 @@ jobs:
       - name: CLI checks
         run: sh tests/ci-check.sh ./oathpass
 
+      - name: Installer dry run
+        run: sh install.sh --dry-run --version "$(cat VERSION)"
+
       - name: Install to a prefix
         run: |
           make install PREFIX="$RUNNER_TEMP/prefix"

@@ -13,6 +13,13 @@ metadata:
 Read `AGENTS.md` at the repository root first: it is the authoritative guide
 for layout, build, versioning and style. This skill is the working procedure.
 
+## Packaging rule
+
+**Release, never hand-build.** A change is not finished until CI has published
+it: `VERSION` bumped, tag `v<VERSION>` pushed, the workflow green on all five
+targets, and `install.sh` able to fetch the new asset. `make install` is a
+development shortcut; the binary in `~/.local/bin` comes from a release.
+
 ## Before changing code
 
 - Read `src/oathpass.c`'s header comment: it states the model (single-use code,
@@ -53,7 +60,11 @@ git commit -am "release: v0.1.1"
 git tag v0.1.1 && git push && git push --tags
 ```
 
-The workflow refuses a tag that disagrees with `VERSION`. Watch it:
+The workflow refuses a tag that disagrees with `VERSION` (`v<VERSION>-rcN` is
+allowed for a dry run, and is published as a prerelease). It builds
+linux-{amd64,arm64} (static musl, the arm64 one under qemu), macos-{arm64,amd64}
+(the x86 one under Rosetta), and windows-amd64 (MSYS2), runs `--selftest` on
+each, and publishes `SHA256SUMS` beside the assets. Watch it:
 
 ```console
 gh run list --workflow release --limit 1

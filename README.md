@@ -32,12 +32,29 @@ further authentication**. `oathpass close` drops it.
 This is also why no credential is ever handed to a client: there is nothing to
 save and nothing to replay.
 
-## Build
+## Install
+
+Binaries are built by CI on every release, never by hand. The installer picks
+the asset for this machine, verifies it against the release's `SHA256SUMS`,
+installs atomically and runs `--selftest`:
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/myhsia/oathpass/main/install.sh | sh
+$ sh install.sh --version 0.3.0 --prefix "$HOME/.local/bin"
+```
+
+Released targets: `macos-arm64`, `macos-amd64`, `linux-arm64`, `linux-amd64`,
+`windows-amd64`. The Linux builds are static musl, so they carry no glibc floor;
+the Windows build needs the MSYS2 runtime on `PATH`. If the selftest fails, the
+previous binary is restored.
+
+## Build from source
+
+Only for development — a change is not finished until CI has published it:
 
 ```console
 $ make                  # needs a C compiler, nothing else
 $ make test             # replays the RFC 6238 vectors
-$ make install          # to $(PREFIX)/bin, default ~/.local/bin
 $ make check            # install, then selftest and PATH check
 ```
 

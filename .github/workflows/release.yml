@@ -16,45 +16,116 @@ jobs:
       - name: compare
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          file="$(cat VERSION)"
-          if [ "$tag" != "$file" ]; then
-            echo "tag $GITHUB_REF_NAME does not match VERSION $file" >&2
-            exit 1
-          fi
+          version="$(cat VERSION)"
+          # a release candidate is v<VERSION>-rcN, a release is v<VERSION>
+          case "$tag" in
+            "$version" | "$version"-*) ;;
+            *)
+              echo "tag $GITHUB_REF_NAME does not match VERSION $version" >&2
+              exit 1
+              ;;
+          esac
 
-  build:
-    name: ${{ matrix.os }}
+  linux:
+    name: linux-${{ matrix.arch }}
     needs: verify
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - arch: amd64
+            target: x86_64-linux-musl
+          - arch: arm64
+            target: aarch64-linux-musl
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build
-        run: make CFLAGS="-O2 -Wall -Wextra -Werror"
+      # Static musl, so the artefact carries no glibc floor: it starts on the
+      # cluster's Rocky Linux 9 whatever libc that machine has.
+      - name: Toolchain
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | tar -xJ
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
 
-      - name: Selftest
+      - name: Build
+        run: make CC="zig cc -target ${{ matrix.target }}" CFLAGS="-O2 -Wall -Wextra -Werror -static"
+
+      - name: Static?
+        run: |
+          file ./oathpass
+          if file ./oathpass | grep -q "dynamically linked"; then
+            echo "the artefact is dynamically linked" >&2
+            exit 1
+          fi
+
+      - name: Selftest (native)
+        if: matrix.arch == 'amd64'
         run: ./oathpass --selftest
+
+      - name: Selftest (emulated)
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+          qemu-aarch64-static ./oathpass --selftest
 
       - name: Package
         run: |
           version="$(cat VERSION)"
-          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-          asset="oathpass-${version}-${os}-$(uname -m)"
           mkdir -p dist
-          cp oathpass "dist/${asset}"
-          chmod +x "dist/${asset}"
+          cp oathpass "dist/oathpass-${version}-linux-${{ matrix.arch }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os }}
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  macos:
+    name: macos-${{ matrix.arch }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            ccflags: ""
+          - arch: amd64
+            ccflags: "-arch x86_64"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: make CFLAGS="-O2 -Wall -Wextra -Werror ${{ matrix.ccflags }}"
+
+      - name: Selftest
+        run: |
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            # Rosetta is what makes the x86 build a tested artefact rather than
+            # a compiled file, so install it or fail.
+            if ! /usr/bin/pgrep -q oahd; then
+              sudo softwareupdate --install-rosetta --agree-to-license
+            fi
+            arch -x86_64 ./oathpass --selftest
+          else
+            ./oathpass --selftest
+          fi
+
+      - name: Package
+        run: |
+          version="$(cat VERSION)"
+          mkdir -p dist
+          cp oathpass "dist/oathpass-${version}-macos-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
           path: dist/*
 
   windows:
-    name: windows-latest (msys2)
+    name: windows-amd64
     needs: verify
     runs-on: windows-latest
     steps:
@@ -79,23 +150,32 @@ jobs:
         run: |
           version="$(cat VERSION)"
           mkdir -p dist
-          cp oathpass "dist/oathpass-${version}-windows-msys2.exe"
-          printf 'This build needs the MSYS2 runtime (msys-2.0.dll).\nIt is provided for completeness; the supported targets are macOS and Linux.\n' > "dist/README-windows.txt"
+          cp oathpass "dist/oathpass-${version}-windows-amd64.exe"
+          printf 'This build needs the MSYS2 runtime (msys-2.0.dll) on PATH.\n' \
+            > "dist/README-windows-amd64.txt"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
+          name: windows-amd64
           path: dist/*
 
   publish:
     name: publish
-    needs: [build, windows]
+    needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          rm -f SHA256SUMS
+          # the README files are not artefacts: checksum only the executables
+          sha256sum oathpass-* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create the release
         env:

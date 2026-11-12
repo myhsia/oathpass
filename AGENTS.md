@@ -21,30 +21,38 @@ dependencies. MIT.
 make                 # -O2 -Wall -Wextra -Werror
 make test            # RFC 6238 vectors, no config needed
 make check           # install, then selftest and a PATH check
-make install         # PREFIX/bin, default ~/.local/bin
 ```
+
+Building is for development. **Users install a release, never a local build**:
+`install.sh` downloads this machine's asset, verifies `SHA256SUMS`, installs
+atomically and runs `--selftest`, restoring the previous binary if that fails.
 
 `CFLAGS` is overridable from the command line; `DEFINES` carries
 `-DOATHPASS_VERSION` and is never overridden, so a `make CFLAGS=…` still stamps
 the version.
 
-## Money
-
-Slurm bills allocated cores per started hour. `job submit` plans first, needs
-`--time`, and refuses above `spend_limit` (¥7.80) without `--yes`; the default
-pick is the fastest plan within the cap, `--cheap` takes the cheapest. Keep the
-partition table (`rate`, `cores`, `min_cores`) honest — the daily rate check in
-`~/.config/opencode/skills/opencode-hpc-update` compares it with the published
-page.
-
 ## Versioning and releasing
 
 1. Bump `VERSION`, commit.
 2. `git tag v<VERSION>` and push the tag.
-3. The release workflow refuses a tag that disagrees with `VERSION`, builds
-   macOS and Linux binaries, runs `--selftest` on each, and publishes a release
-   with the artifacts attached. A tag containing `-` is published as a
-   prerelease.
+3. The release workflow refuses a tag that disagrees with `VERSION` (a
+   `v<VERSION>-rcN` candidate is allowed), builds five targets, runs `--selftest`
+   on each, and publishes the assets plus `SHA256SUMS`. A tag containing `-` is
+   published as a prerelease.
+
+The five targets, and how each is proven:
+
+| target | build | executed in CI |
+|---|---|---|
+| linux-amd64 | native, static musl | native `--selftest` |
+| linux-arm64 | `zig cc` aarch64-musl, static | `qemu-aarch64-static` |
+| macos-arm64 | native | native |
+| macos-amd64 | `-arch x86_64` | `arch -x86_64` under Rosetta |
+| windows-amd64 | MSYS2 `gcc` | native |
+
+A target is released only if its binary *ran* the selftest. `windows-arm64` is
+not released: MSYS2 has no Cygwin layer for it, so the source would need a native
+Win32 port first, and no runner here can execute an aarch64 Windows binary.
 
 Never commit the built binary: `/oathpass` is ignored.
 
