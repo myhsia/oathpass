@@ -108,26 +108,6 @@ expect 1 "rsync refuses its own -e"    "$TMP/valid.json" rsync -e ssh x :y
 expect 1 "rsync refuses --rsync-path"  "$TMP/valid.json" rsync --rsync-path=rm x :y
 expect 3 "rsync with no network"       "$TMP/valid.json" rsync -a ./x :y
 
-# Jobs: the caller decides the partition and the wall time.
-expect 1 "job without --time"          "$TMP/valid.json" job submit -p intel-sc3 -c 4 "$TMP/x.sh"
-expect 1 "job without -p"              "$TMP/valid.json" job submit -c 4 --time 00:05:00 "$TMP/x.sh"
-expect 1 "job with an unknown subcommand" "$TMP/valid.json" job frobnicate
-expect 1 "job with a bad mail trigger" "$TMP/valid.json" job submit --dry-run -p intel-sc3 -c 1 --time 00:02:00 --mail-type BOGUS "$TMP/x.sh"
-
-use_config "$TMP/valid.json"
-dry=$("$BIN" job submit --dry-run -p intel-sc3 -c 1 --time 00:02:00 "$TMP/x.sh")
-if printf '%s\n' "$dry" | grep -q 'mail-user=ci@example.org.*mail-type=END,FAIL,TIME_LIMIT_80'; then
-    ok "dry run derives the mail address and triggers"
-else
-    bad "dry run derives the mail address and triggers" "$dry"
-fi
-quiet=$("$BIN" job submit --dry-run --no-mail -p intel-sc3 -c 1 --time 00:02:00 "$TMP/x.sh")
-if printf '%s\n' "$quiet" | grep -q 'mail-user'; then
-    bad "--no-mail suppresses the address"
-else
-    ok "--no-mail suppresses the address"
-fi
-
 expect 1 "sftp refuses interactive"    "$TMP/valid.json" sftp
 expect 3 "sftp accepts a valid batch"  "$TMP/valid.json" sftp -b "$TMP/batch-ok.txt"
 # A bad *second* line must be caught. If only the first line were validated

@@ -766,8 +766,6 @@ typedef struct {
     int ports[16];
     size_t nports;
     char ports_render[128];
-    char mail_domain[128];
-    char mail_user[128];
 } Config;
 
 static int is_placeholder(const char *s) {
@@ -900,13 +898,6 @@ static void load_config(Config *cfg) {
             used += (size_t)snprintf(cfg->ports_render + used, sizeof cfg->ports_render - used, "%s%d",
                                      i ? "," : "", cfg->ports[i]);
     }
-
-    JVal *mail_domain = jget(block, "mail_domain");
-    if (mail_domain && mail_domain->type == J_STR && !is_placeholder(mail_domain->str))
-        snprintf(cfg->mail_domain, sizeof cfg->mail_domain, "%s", mail_domain->str);
-    JVal *mail_user = jget(block, "mail_user");
-    if (mail_user && mail_user->type == J_STR && !is_placeholder(mail_user->str))
-        snprintf(cfg->mail_user, sizeof cfg->mail_user, "%s", mail_user->str);
 
     JVal *time_url = jget(block, "time_url");
     if (time_url && time_url->type == J_STR && time_url->str[0] && !is_placeholder(time_url->str))
@@ -1739,231 +1730,6 @@ static int cmd_rsync(const Config *cfg, int forced_index, int forced_port, int a
     return 1;
 }
 
-/* --------------------------------------------------------------- jobs
- * Submission is a write, so it is its own surface: it plans the money first,
- * refuses without --time, and refuses above the spend cap without --yes.
- */
-
-static int run_remote(const Config *cfg, const char *sock, int port, const char *remote,
-                      FILE *input, char *out, size_t outsz) {
-    char portbuf[16], target[600];
-    snprintf(portbuf, sizeof portbuf, "%d", port);
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
-
-    char *slots[16];
-    memset(slots, 0, sizeof slots);
-    slots[0] = "ssh";
-    slots[1] = "-S";
-    slots[2] = (char *)sock;
-    slots[3] = "-p";
-    slots[4] = portbuf;
-    slots[5] = "-T";
-    slots[6] = target;
-    /* Slurm lives under /soft and only the login profile puts it on PATH, so a
-       bare `ssh host sbatch` fails; a login shell fixes that. */
-    static char wrapped[2048];
-    snprintf(wrapped, sizeof wrapped, "bash -lc '%s'", remote);
-    slots[7] = wrapped;
-    slots[8] = NULL;
-
-    set_askpass_env();
-    int pipefd[2] = {-1, -1};
-    if (out && outsz && pipe(pipefd) != 0) die("pipe: %s", strerror(errno));
-
-    pid_t pid = fork();
-    if (pid < 0) die("fork: %s", strerror(errno));
-    if (pid == 0) {
-        if (input) dup2(fileno(input), STDIN_FILENO);
-        if (out) dup2(pipefd[1], STDOUT_FILENO);
-        if (out) {
-            close(pipefd[0]);
-            close(pipefd[1]);
-        }
-        execvp(slots[0], slots);
-        _exit(127);
-    }
-    if (out) {
-        close(pipefd[1]);
-        size_t used = 0;
-        ssize_t got;
-        while ((got = read(pipefd[0], out + used, outsz - 1 - used)) > 0) {
-            used += (size_t)got;
-            if (used + 1 >= outsz) break;
-        }
-        out[used] = '\0';
-        close(pipefd[0]);
-    }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 255;
-}
-
-static int job_id_ok(const char *id) {
-    if (!*id) return 0;
-    for (const char *p = id; *p; p++)
-        if (*p < '0' || *p > '9') return 0;
-    return 1;
-}
-
-/* "HH:MM:SS", "MM:SS", or a bare number of minutes. */
-static int parse_time(const char *text, double *hours) {
-    int h = 0, m = 0, sec = 0;
-    if (sscanf(text, "%d:%d:%d", &h, &m, &sec) == 3) {
-        *hours = h + m / 60.0 + sec / 3600.0;
-        return *hours > 0;
-    }
-    if (sscanf(text, "%d:%d", &m, &sec) == 2) {
-        *hours = m / 60.0 + sec / 3600.0;
-        return *hours > 0;
-    }
-    if (sscanf(text, "%d", &m) == 1) {
-        *hours = m / 60.0;
-        return *hours > 0;
-    }
-    return 0;
-}
-
-static int mail_type_ok(const char *list) {
-    static const char *const allowed[] = {"BEGIN",  "END",        "FAIL",  "TIME_LIMIT",
-                                          "TIME_LIMIT_80", "TIME_LIMIT_90", "TIME_LIMIT_50",
-                                          "ARRAY_TASKS", "INVALID_DEPEND", "ALL", "NONE", NULL};
-    char copy[256];
-    snprintf(copy, sizeof copy, "%s", list);
-    for (char *token = strtok(copy, ","); token; token = strtok(NULL, ",")) {
-        int found = 0;
-        for (size_t i = 0; allowed[i]; i++)
-            if (!strcasecmp(token, allowed[i])) found = 1;
-        if (!found) return 0;
-    }
-    return 1;
-}
-
-static int cmd_job(const Config *cfg, int forced_index, int forced_port, int argc, char **argv) {
-    if (argc < 1) die("job needs submit, list, show, log, cancel or shell");
-
-    const char *sub = argv[0];
-    int cores = 1;
-    double hours = 0;
-    const char *script = NULL, *partition = NULL, *qos = NULL, *mem = NULL;
-    const char *mail_type = NULL;
-    int no_mail = 0, dry_run = 0;
-
-    if (!strcmp(sub, "list")) {
-        char sock[CONTROL_PATH_MAX];
-        int port = 0;
-        int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
-        if (rc) return rc;
-        return run_remote(cfg, sock, port,
-                          "squeue -u \"$USER\" -o \"%.8i %.20j %.9T %.11M %.5D %R\"", NULL, NULL, 0);
-    }
-
-    if (!strcmp(sub, "show") || !strcmp(sub, "log") || !strcmp(sub, "cancel")) {
-        if (argc < 2 || !job_id_ok(argv[1])) die("%s needs a numeric job id", sub);
-        char sock[CONTROL_PATH_MAX];
-        int port = 0;
-        int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
-        if (rc) return rc;
-        char remote[512];
-        if (!strcmp(sub, "show"))
-            snprintf(remote, sizeof remote,
-                     "sacct -j %s --noheader --format=JobID%%20,JobName%%24,State%%12,"
-                     "Elapsed%%12,AllocCPUS%%10,ReqMem%%10,MaxRSS%%12,ExitCode%%10",
-                     argv[1]);
-        else if (!strcmp(sub, "log"))
-            snprintf(remote, sizeof remote, "cat jobs/slurm-%s.out", argv[1]);
-        else
-            snprintf(remote, sizeof remote, "scancel %s", argv[1]);
-        return run_remote(cfg, sock, port, remote, NULL, NULL, 0);
-    }
-
-    if (strcmp(sub, "submit") && strcmp(sub, "shell"))
-        die("unknown job command '%s'", sub);
-
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-c") && i + 1 < argc) cores = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--time") && i + 1 < argc) {
-            if (!parse_time(argv[++i], &hours)) die("--time must be HH:MM:SS, MM:SS or minutes");
-        } else if (!strcmp(argv[i], "-p") && i + 1 < argc) partition = argv[++i];
-        else if (!strcmp(argv[i], "-q") && i + 1 < argc) qos = argv[++i];
-        else if (!strcmp(argv[i], "--mem") && i + 1 < argc) mem = argv[++i];
-        else if (!strcmp(argv[i], "--mail-type") && i + 1 < argc) mail_type = argv[++i];
-        else if (!strcmp(argv[i], "--no-mail")) no_mail = 1;
-        else if (!strcmp(argv[i], "--dry-run")) dry_run = 1;
-        else if (argv[i][0] == '-') die("unknown option '%s'", argv[i]);
-        else script = argv[i];
-    }
-    if (hours <= 0) die("--time is required: no job is submitted without a wall-clock limit");
-    if (!partition)
-        die("-p PARTITION is required: price the job first (hpc-job cost) and pass the partition");
-    if (cores < 1) die("-c must be at least 1");
-    if (mail_type && !mail_type_ok(mail_type))
-        die("--mail-type takes Slurm triggers: BEGIN,END,FAIL,TIME_LIMIT_80,ARRAY_TASKS,...");
-    if (!strcmp(sub, "submit") && !script) die("job submit needs a script");
-
-    char wall[32];
-    long total = (long)(hours * 3600.0 + 0.5);
-    snprintf(wall, sizeof wall, "%02ld:%02ld:%02ld", total / 3600, (total / 60) % 60, total % 60);
-
-    char mail[512] = "";
-    if (!no_mail && cfg->mail_domain[0]) {
-        const char *who = cfg->mail_user[0] ? cfg->mail_user : cfg->user;
-        const char *types = mail_type ? mail_type : "END,FAIL,TIME_LIMIT_80";
-        snprintf(mail, sizeof mail, " --mail-user=%s@%s --mail-type=%s", who, cfg->mail_domain, types);
-    }
-
-    const char *base = strrchr(script, '/');
-    base = base ? base + 1 : script;
-
-    char sbatch[2048];
-    snprintf(sbatch, sizeof sbatch,
-             "sbatch --parsable -o jobs/slurm-%%j.out -J %.40s -p %s -c %d -t %s%s%s%s%s%s jobs/%s", base,
-             partition, cores, wall, qos ? " -q " : "", qos ? qos : "", mem ? " --mem=" : "",
-             mem ? mem : "", mail, base);
-    if (dry_run) {
-        printf("%s\n", sbatch);
-        return 0;
-    }
-
-    char sock[CONTROL_PATH_MAX];
-    int port = 0;
-    int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
-    if (rc) return rc;
-
-    if (!strcmp(sub, "shell")) {
-        char remote[1024];
-        snprintf(remote, sizeof remote, "srun --pty --time=%s -c %d -p %s%s%s bash", wall, cores,
-                 partition, qos ? " -q " : "", qos ? qos : "");
-        return run_remote(cfg, sock, port, remote, NULL, NULL, 0);
-    }
-
-    if (!*base || strchr(base, ' ')) die("the script name must not contain spaces");
-
-    FILE *fp = fopen(script, "r");
-    if (!fp) die("cannot read %s: %s", script, strerror(errno));
-    char remote[1024];
-    snprintf(remote, sizeof remote, "mkdir -p jobs && cat > jobs/%s", base);
-    rc = run_remote(cfg, sock, port, remote, fp, NULL, 0);
-    fclose(fp);
-    if (rc != 0) return rc;
-
-    char output[256];
-    rc = run_remote(cfg, sock, port, sbatch, NULL, output, sizeof output);
-    if (rc != 0) return rc;
-
-    char *nl = strchr(output, '\n');
-    if (nl) *nl = '\0';
-    char *semi = strchr(output, ';');
-    if (semi) *semi = '\0';
-    if (!job_id_ok(output)) die("sbatch did not return a job id (got '%s')", output);
-
-    printf("\nsubmitted  job %s  on %s, %d cores, wall %s\n", output, partition, cores, wall);
-    printf("watch      oathpass job show %s   /   oathpass job log %s\n", output, output);
-    printf("cancel     oathpass job cancel %s\n", output);
-    if (mail[0]) printf("notify     %s\n", mail + 1);
-    return 0;
-}
-
 static int cmd_status(const Config *cfg, int forced_index, int forced_port) {
     Node nodes[16];
     int answered = 0;
@@ -2570,11 +2336,6 @@ static int usage(void) {
            "       oathpass status               node, master state, socket\n"
            "       oathpass sockpath             print the socket, for rsync -e\n"
            "       oathpass close                drop the shared connection\n"
-           "       oathpass job submit -p P -c N --time T SCRIPT\n"
-           "                                     Slurm submit; price it first (hpc-job cost)\n"
-           "       oathpass job list|show ID|log ID|cancel ID|shell\n"
-           "                                     --mail-type END,FAIL,TIME_LIMIT_80 by default\n"
-           "                                     --no-mail suppresses it\n"
            "       oathpass check                dry run: node, code, nothing sent\n"
            "       oathpass otp [--at EPOCH]     print the current code\n"
            "       oathpass port                 print the login port in use\n"
@@ -2640,7 +2401,7 @@ int main(int argc, char **argv) {
 
     static const char *const with_config[] = {
         "otp", "target", "doctor", "wrap", "port", "check", "--dry-run",
-        "run", "sftp", "scp", "rsync", "status", "sockpath", "close", "job", NULL};
+        "run", "sftp", "scp", "rsync", "status", "sockpath", "close", NULL};
     int known = 0;
     for (size_t i = 0; with_config[i]; i++)
         if (!strcmp(command, with_config[i])) known = 1;
@@ -2661,7 +2422,6 @@ int main(int argc, char **argv) {
         if (!strcmp(command, "status")) return cmd_status(&cfg, forced_node, forced_port);
         if (!strcmp(command, "sockpath")) return cmd_sockpath(&cfg, forced_node, forced_port);
         if (!strcmp(command, "close")) return cmd_close(&cfg, forced_port);
-        if (!strcmp(command, "job")) return cmd_job(&cfg, forced_node, forced_port, restc - 1, rest + 1);
         return cmd_wrap(&cfg, restc - 1, rest + 1);
     }
 

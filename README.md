@@ -86,7 +86,6 @@ and never let an SFTP client save a code for the account.
 | `oathpass sftp -b FILE\|-` | batch sftp (interactive sftp is refused) |
 | `oathpass scp <args…>` | scp; `:path` means `<user>@<host>:path` |
 | `oathpass rsync <args…>` | rsync over the master, same path rules |
-| `oathpass job submit\|list\|show\|log\|cancel\|shell` | Slurm jobs over the master |
 | `oathpass check` | dry run: node, code, ssh line; nothing sent |
 | `oathpass otp [--at EPOCH]` | print the current code |
 | `oathpass port` / `target` | the chosen port / `user@host` |
@@ -97,21 +96,13 @@ and never let an SFTP client save a code for the account.
 | `oathpass --selftest` | replay the RFC 6238 vectors |
 | `--node N` / `--port P` | pin one login node |
 
-## Jobs
+## Jobs are not here
 
-Slurm submission rides the master like everything else, but the tool makes no
-money decisions: `-p` and `--time` are both required, and pricing lives with
-the caller.
-
-```bash
-oathpass job submit -p PARTITION -c 16 --time 04:00:00 ./run.sh
-oathpass job list | show ID | log ID | cancel ID | shell -p PARTITION --time 1:00:00
-```
-
-`--time` is mandatory because the cluster's default is *no limit at all*.
-Choosing a partition is a cost decision, so it is passed in rather than
-guessed; the companion `hpc-job` wrapper prices a job from a local rate table
-and picks one.
+This tool gets you an authenticated connection, read-only commands and file
+transfer -- nothing about Slurm. Job submission, the queue, completion mail and
+the pricing that decides a partition live in the companion `hpc-job` wrapper,
+which drives `oathpass` for the connection. Keeping them apart is deliberate:
+the name says what this does.
 
 ## What the guard is and is not
 
