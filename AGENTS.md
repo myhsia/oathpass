@@ -31,6 +31,16 @@ atomically and runs `--selftest`, restoring the previous binary if that fails.
 `-DOATHPASS_VERSION` and is never overridden, so a `make CFLAGS=…` still stamps
 the version.
 
+## Profiles
+
+`~/.config/oathpass/config.json` holds `{default, profiles: {NAME: {host, ports, user, otp}}}`;
+the installer never writes it.  Selection is `--profile` > `$OATHPASS_PROFILE` > `default` > the only
+profile.  Two invariants, both tested in `tests/ci-check.sh`: the master socket name carries the
+profile (`control-NAME-PORT`), and the askpass child inherits `OATHPASS_PROFILE`, so it cannot answer
+with another profile's seed.  The config is rewritten only by `--init` and `profiles`, through a
+writer that walks the parsed tree, so unknown keys survive; a flat pre-profiles file is read as
+`default` and migrated on the first write.
+
 ## Versioning and releasing
 
 1. Bump `VERSION`, commit.

@@ -94,6 +94,11 @@
 
 #define CONTROL_PATH_MAX 4096
 
+/* Profile chosen by --profile or $OATHPASS_PROFILE; empty means "the config's
+   default".  The askpass child inherits it, so a re-entered process answers
+   with the same profile's seed. */
+static char g_profile[64];
+
 /* Any HTTPS host returns a Date header; override with "time_url" in the config. */
 static char g_time_url[256] = "https://1.1.1.1";
 
@@ -766,6 +771,7 @@ typedef struct {
     int ports[16];
     size_t nports;
     char ports_render[128];
+    char profile[64];
 } Config;
 
 static int is_placeholder(const char *s) {
@@ -841,6 +847,211 @@ static void parse_otpauth(const char *uri, Token *tok, char *secret, size_t secr
     free(copy);
 }
 
+
+/* ------------------------------------------------------------- JSON output
+ * The config is rewritten only by `--init` and `profiles`, and the writer walks
+ * the parsed tree rather than the Config struct, so keys this program does not
+ * model (time_url today, anything later) survive a rewrite.
+ */
+
+static JVal *jstr(const char *text) {
+    JVal *value = jnew(J_STR);
+    value->str = strdup(text ? text : "");
+    if (!value->str) die("out of memory");
+    return value;
+}
+
+
+/* Replace a key in place, or append it. */
+static void jset(JVal *obj, const char *key, JVal *value) {
+    for (size_t i = 0; i < obj->count; i++)
+        if (obj->keys[i] && !strcmp(obj->keys[i], key)) {
+            obj->items[i] = value;
+            return;
+        }
+    jpush(obj, strdup(key), value);
+}
+
+static void jdel(JVal *obj, const char *key) {
+    if (!obj || obj->type != J_OBJ) return;
+    for (size_t i = 0; i < obj->count; i++) {
+        if (!obj->keys[i] || strcmp(obj->keys[i], key)) continue;
+        for (size_t k = i; k + 1 < obj->count; k++) {
+            obj->keys[k] = obj->keys[k + 1];
+            obj->items[k] = obj->items[k + 1];
+        }
+        obj->count--;
+        return;
+    }
+}
+
+static void jemit_indent(FILE *out, int depth) {
+    for (int i = 0; i < depth; i++) fputs("  ", out);
+}
+
+static void jemit_string(FILE *out, const char *text) {
+    fputc('"', out);
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        switch (*p) {
+        case '"': fputs("\\\"", out); break;
+        case '\\': fputs("\\\\", out); break;
+        case '\n': fputs("\\n", out); break;
+        case '\r': fputs("\\r", out); break;
+        case '\t': fputs("\\t", out); break;
+        default:
+            if (*p < 0x20) fprintf(out, "\\u%04x", *p);
+            else fputc(*p, out);
+        }
+    }
+    fputc('"', out);
+}
+
+static void jemit_number(FILE *out, double value) {
+    char text[64];
+    snprintf(text, sizeof text, "%.17g", value);
+    if (!strpbrk(text, "eE")) {
+        char *dot = strchr(text, '.');
+        if (dot) {
+            char *end = text + strlen(text) - 1;
+            while (end > dot && *end == '0') *end-- = '\0';
+            if (*end == '.') *end = '\0';
+        }
+    }
+    fputs(text, out);
+}
+
+static void jemit(FILE *out, const JVal *v, int depth) {
+    if (!v) {
+        fputs("null", out);
+        return;
+    }
+    switch (v->type) {
+    case J_NULL: fputs("null", out); break;
+    case J_BOOL: fputs(v->boolean ? "true" : "false", out); break;
+    case J_NUM: jemit_number(out, v->num); break;
+    case J_STR: jemit_string(out, v->str ? v->str : ""); break;
+    case J_ARR:
+        if (!v->count) {
+            fputs("[]", out);
+            break;
+        }
+        fputs("[\n", out);
+        for (size_t i = 0; i < v->count; i++) {
+            jemit_indent(out, depth + 1);
+            jemit(out, v->items[i], depth + 1);
+            fputs(i + 1 < v->count ? ",\n" : "\n", out);
+        }
+        jemit_indent(out, depth);
+        fputc(']', out);
+        break;
+    case J_OBJ:
+        if (!v->count) {
+            fputs("{}", out);
+            break;
+        }
+        fputs("{\n", out);
+        for (size_t i = 0; i < v->count; i++) {
+            jemit_indent(out, depth + 1);
+            jemit_string(out, v->keys[i] ? v->keys[i] : "");
+            fputs(": ", out);
+            jemit(out, v->items[i], depth + 1);
+            fputs(i + 1 < v->count ? ",\n" : "\n", out);
+        }
+        jemit_indent(out, depth);
+        fputc('}', out);
+        break;
+    }
+}
+
+/* A profile is a key of `profiles`, or -- in a file written before profiles
+   existed -- the `oathpass` object itself, which is then named "default". */
+static JVal *profiles_object(JVal *doc, int create) {
+    JVal *profiles = jget(doc, "profiles");
+    if (profiles && profiles->type == J_OBJ) return profiles;
+    if (!create) return NULL;
+    profiles = jnew(J_OBJ);
+    jset(doc, "profiles", profiles);
+    return profiles;
+}
+
+static int profile_names(JVal *doc, char names[][64], size_t max) {
+    JVal *profiles = profiles_object(doc, 0);
+    if (!profiles) {
+        snprintf(names[0], 64, "default");
+        return 1;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < profiles->count && n < max; i++)
+        snprintf(names[n++], 64, "%s", profiles->keys[i] ? profiles->keys[i] : "");
+    return (int)n;
+}
+
+static void join_names(char names[][64], int count, char *out, size_t outsz) {
+    out[0] = '\0';
+    for (int i = 0; i < count; i++) {
+        strncat(out, names[i], outsz - strlen(out) - 1);
+        if (i + 1 < count) strncat(out, ", ", outsz - strlen(out) - 1);
+    }
+}
+
+/* --profile / $OATHPASS_PROFILE, else the config's `default`, else the only
+   profile present. */
+static JVal *select_profile(JVal *doc, const char *path, char out_name[64]) {
+    JVal *profiles = profiles_object(doc, 0);
+    char names[32][64];
+    int count = profile_names(doc, names, 32);
+
+    const char *wanted = g_profile[0] ? g_profile : NULL;
+    if (!wanted) {
+        JVal *fallback = jget(doc, "default");
+        if (fallback && fallback->type == J_STR && fallback->str[0]) wanted = fallback->str;
+    }
+    if (!wanted && count == 1) {
+        snprintf(out_name, 64, "%s", names[0]);
+        return profiles ? jget(profiles, names[0]) : doc;
+    }
+    if (!wanted) {
+        char listing[512];
+        join_names(names, count, listing, sizeof listing);
+        die("no default profile in %s -- pass --profile NAME (have: %s)", path, listing);
+    }
+    if (!profiles) {
+        if (strcmp(wanted, "default") != 0)
+            die("%s holds a single profile named \"default\", not \"%s\" -- "
+                "run --init --profile %s to add it",
+                path, wanted, wanted);
+        snprintf(out_name, 64, "%s", wanted);
+        return doc;
+    }
+    JVal *chosen = jget(profiles, wanted);
+    if (!chosen || chosen->type != J_OBJ) {
+        char listing[512];
+        join_names(names, count, listing, sizeof listing);
+        die("no profile '%s' in %s -- have: %s", wanted, path, listing);
+    }
+    snprintf(out_name, 64, "%s", wanted);
+    return chosen;
+}
+
+/* A legacy flat document becomes profiles["default"], so a user who never ran
+   --init keeps their working profile. */
+static void migrate_flat_profile(JVal *doc) {
+    if (jget(doc, "profiles")) return;
+    if (!jget(doc, "host")) return;
+    JVal *entry = jnew(J_OBJ);
+    static const char *const moved[] = {"host", "user", "password", "ports", "otp",
+                                        "time_url", "mail_domain", "mail_user", NULL};
+    for (size_t i = 0; moved[i]; i++) {
+        JVal *value = jget(doc, moved[i]);
+        if (!value) continue;
+        jset(entry, moved[i], value);
+        jdel(doc, moved[i]);
+    }
+    JVal *profiles = profiles_object(doc, 1);
+    jset(profiles, "default", entry);
+    if (!jget(doc, "default")) jset(doc, "default", jstr("default"));
+}
+
 static void load_config(Config *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->token.digits = 8;
@@ -857,8 +1068,10 @@ static void load_config(Config *cfg) {
     char *text = slurp(path);
     JParser jp = {text, text};
     JVal *root = jparse_value(&jp);
-    JVal *block = jget(root, "oathpass");
-    if (!block) die("no \"oathpass\" object in %s", path);
+    JVal *doc = jget(root, "oathpass");
+    if (!doc) die("no \"oathpass\" object in %s", path);
+    JVal *block = select_profile(doc, path, cfg->profile);
+    if (!block) die("no profile selected in %s", path);
 
     JVal *host = jget(block, "host");
     JVal *user = jget(block, "user");
@@ -1255,15 +1468,16 @@ static void mkdir_p(const char *path) {
     mkdir(tmp, 0700);
 }
 
-static void control_path(int port, char out[CONTROL_PATH_MAX]) {
+static void control_path(const char *profile, int port, char out[CONTROL_PATH_MAX]) {
     const char *cache = getenv("XDG_CACHE_HOME");
     const char *home = getenv("HOME");
     int written;
     if (cache && *cache) {
-        written = snprintf(out, CONTROL_PATH_MAX, "%s/oathpass/control-%d", cache, port);
+        written = snprintf(out, CONTROL_PATH_MAX, "%s/oathpass/control-%s-%d", cache, profile, port);
     } else {
         if (!home) die("HOME is not set");
-        written = snprintf(out, CONTROL_PATH_MAX, "%s/.cache/oathpass/control-%d", home, port);
+        written = snprintf(out, CONTROL_PATH_MAX, "%s/.cache/oathpass/control-%s-%d", home,
+                           profile, port);
     }
     if (written < 0 || (size_t)written >= CONTROL_PATH_MAX) die("the control socket path is too long");
 
@@ -1276,8 +1490,9 @@ static void control_path(int port, char out[CONTROL_PATH_MAX]) {
     chmod(dir, 0700);
 }
 
-static void set_askpass_env(void) {
+static void set_askpass_env(const char *profile) {
     setenv("OATHPASS_ASKPASS", "1", 1);
+    if (profile && *profile) setenv("OATHPASS_PROFILE", profile, 1);
     setenv("SSH_ASKPASS", self_path(), 1);
     setenv("SSH_ASKPASS_REQUIRE", "force", 1);
     if (!getenv("DISPLAY")) setenv("DISPLAY", ":0", 1);
@@ -1331,7 +1546,7 @@ static int ensure_master(const Config *cfg, int forced_index, int forced_port,
     if (count < 0) return report_no_network(cfg, forced_index, forced_port);
 
     int port = nodes[0].port;
-    control_path(port, sock);
+    control_path(cfg->profile, port, sock);
     if (port_out) *port_out = port;
     if (master_alive(sock, port, cfg)) return 0;
 
@@ -1366,7 +1581,7 @@ static int ensure_master(const Config *cfg, int forced_index, int forced_port,
         slots[i++] = target;
         slots[i] = NULL;
 
-        set_askpass_env();
+        set_askpass_env(cfg->profile);
         Tail tail;
         memset(&tail, 0, sizeof tail);
         int status = run_command(slots, self_path(), &tail);
@@ -1491,7 +1706,7 @@ static int cmd_run(const Config *cfg, int forced_index, int forced_port, int arg
     slots[7] = remote;
     slots[8] = NULL;
 
-    set_askpass_env();
+    set_askpass_env(cfg->profile);
     Tail tail;
     memset(&tail, 0, sizeof tail);
     return run_command(slots, self_path(), &tail);
@@ -1739,7 +1954,7 @@ static int cmd_status(const Config *cfg, int forced_index, int forced_port) {
 
     int port = nodes[0].port;
     char sock[CONTROL_PATH_MAX];
-    control_path(port, sock);
+    control_path(cfg->profile, port, sock);
     printf("node     %d of %zu, port %d\n", nodes[0].index + 1, cfg->nports, port);
     printf("master   %s\n", master_alive(sock, port, cfg) ? "connected" : "not connected (the next command opens it)");
     printf("socket   %s\n", sock);
@@ -1760,7 +1975,7 @@ static int cmd_close(const Config *cfg, int forced_port) {
     for (size_t i = 0; i < cfg->nports; i++) {
         int port = forced_port ? forced_port : cfg->ports[i];
         char sock[CONTROL_PATH_MAX];
-        control_path(port, sock);
+        control_path(cfg->profile, port, sock);
         if (!master_alive(sock, port, cfg)) continue;
         if (master_exit(sock, port, cfg)) {
             printf("closed port %d\n", port);
@@ -1795,7 +2010,7 @@ static int cmd_login(const Config *cfg, char **userargs, int forced_index, int f
     for (char **extra = userargs; extra && *extra && i < 60; extra++) slots[i++] = *extra;
     slots[i] = NULL;
 
-    set_askpass_env();
+    set_askpass_env(cfg->profile);
     Tail tail;
     memset(&tail, 0, sizeof tail);
     return run_command(slots, self_path(), &tail);
@@ -1841,7 +2056,7 @@ static int cmd_check(const Config *cfg, int forced_index, int forced_port) {
 
     int port = nodes[0].port;
     char sock[CONTROL_PATH_MAX];
-    control_path(port, sock);
+    control_path(cfg->profile, port, sock);
 
     double now = monotime();
     char code[16];
@@ -2036,6 +2251,45 @@ struct Setup {
     char uri[1024];
 };
 
+
+static JVal *load_document(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        JVal *root = jnew(J_OBJ);
+        jset(root, "oathpass", jnew(J_OBJ));
+        return root;
+    }
+    char *text = read_all(f);
+    fclose(f);
+    JParser jp = {text, text};
+    JVal *root = jparse_value(&jp);
+    if (root->type != J_OBJ) die("%s does not hold a JSON object", path);
+    return root;
+}
+
+static void store_document(const char *path, JVal *root) {
+    char dir[CONTROL_PATH_MAX];
+    size_t length = strlen(path);
+    if (length >= sizeof dir) die("path too long");
+    memcpy(dir, path, length + 1);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0';
+    mkdir_p(dir);
+    chmod(dir, 0700);
+
+    char temporary[CONTROL_PATH_MAX];
+    snprintf(temporary, sizeof temporary, "%s.tmp", path);
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) die("cannot write %s: %s", temporary, strerror(errno));
+    FILE *out = fdopen(fd, "w");
+    if (!out) die("cannot write %s", temporary);
+    jemit(out, root, 0);
+    fputc('\n', out);
+    if (fclose(out) != 0) die("cannot write %s", temporary);
+    chmod(temporary, 0600);
+    if (rename(temporary, path) != 0) die("cannot move the config into place: %s", strerror(errno));
+}
+
 static int config_ready(void) {
     FILE *f = fopen(config_path(), "rb");
     if (!f) return 0;
@@ -2064,20 +2318,6 @@ static void print_guide(const char *path) {
            path);
 }
 
-static void json_escape(const char *in, char *out, size_t outsz) {
-    size_t o = 0;
-    for (const char *p = in; *p && o + 8 < outsz; p++) {
-        if (*p == '"' || *p == '\\') {
-            out[o++] = '\\';
-            out[o++] = *p;
-        } else if ((unsigned char)*p < 0x20) {
-            o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", (unsigned char)*p);
-        } else {
-            out[o++] = *p;
-        }
-    }
-    out[o] = '\0';
-}
 
 static int parse_ports(const char *text, struct Setup *s) {
     char copy[512];
@@ -2169,104 +2409,167 @@ static void wipe(void *buffer, size_t length) {
     while (length--) *p++ = 0;
 }
 
-static void write_setup(const char *path, const struct Setup *setup) {
-    char host[600], user[600], uri[2400], ports[300];
-    json_escape(setup->host, host, sizeof host);
-    json_escape(setup->user, user, sizeof user);
-    json_escape(setup->uri, uri, sizeof uri);
-
-    size_t used = 0;
-    for (size_t i = 0; i < setup->nports; i++) {
-        int written = snprintf(ports + used, sizeof ports - used, "%s\"%d\"", i ? ", " : "",
-                               setup->ports[i]);
-        if (written < 0 || (size_t)written >= sizeof ports - used) die("too many ports");
-        used += (size_t)written;
+static void write_setup(const char *path, const char *profile, const struct Setup *setup) {
+    JVal *root = load_document(path);
+    JVal *doc = jget(root, "oathpass");
+    if (!doc) {
+        doc = jnew(J_OBJ);
+        jset(root, "oathpass", doc);
     }
+    migrate_flat_profile(doc);
 
-    char dir[CONTROL_PATH_MAX];
-    size_t length = strlen(path);
-    if (length >= sizeof dir) die("path too long");
-    memcpy(dir, path, length + 1);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0';
-    mkdir_p(dir);
-    chmod(dir, 0700);
+    JVal *entry = jnew(J_OBJ);
+    jset(entry, "host", jstr(setup->host));
+    JVal *ports = jnew(J_ARR);
+    for (size_t i = 0; i < setup->nports; i++) {
+        char text[16];
+        snprintf(text, sizeof text, "%d", setup->ports[i]);
+        jpush(ports, NULL, jstr(text));
+    }
+    jset(entry, "ports", ports);
+    jset(entry, "user", jstr(setup->user));
+    JVal *otp = jnew(J_OBJ);
+    jset(otp, "uri", jstr(setup->uri));
+    jset(entry, "otp", otp);
 
-    char temporary[CONTROL_PATH_MAX];
-    snprintf(temporary, sizeof temporary, "%s.tmp", path);
+    JVal *profiles = profiles_object(doc, 1);
+    jset(profiles, profile, entry);
+    if (!jget(doc, "default")) jset(doc, "default", jstr(profile));
 
-    char body[4096];
-    int n = snprintf(body, sizeof body,
-                     "{\n"
-                     "  \"oathpass\": {\n"
-                     "    \"host\": \"%s\",\n"
-                     "    \"ports\": [%s],\n"
-                     "    \"user\": \"%s\",\n"
-                     "    \"otp\": {\n"
-                     "      \"uri\": \"%s\"\n"
-                     "    }\n"
-                     "  }\n"
-                     "}\n",
-                     host, ports, user, uri);
-    if (n < 0 || (size_t)n >= sizeof body) die("the configuration is too long");
-
-    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) die("cannot write %s: %s", temporary, strerror(errno));
-    if (write(fd, body, (size_t)n) != n) die("cannot write %s", temporary);
-    close(fd);
-    chmod(temporary, 0600);
-    if (rename(temporary, path) != 0) die("cannot move the config into place: %s", strerror(errno));
-    wipe(body, sizeof body);
+    store_document(path, root);
 }
 
-static void write_skeleton(const char *path) {
+static void write_skeleton(const char *path, const char *profile) {
     struct stat st;
     if (stat(path, &st) == 0) return; /* never touch an existing file */
 
-    char dir[CONTROL_PATH_MAX];
-    size_t length = strlen(path);
-    if (length >= sizeof dir) die("path too long");
-    memcpy(dir, path, length + 1);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0';
-    mkdir_p(dir);
-    chmod(dir, 0700);
+    JVal *root = jnew(J_OBJ);
+    JVal *doc = jnew(J_OBJ);
+    jset(root, "oathpass", doc);
+    jset(doc, "default", jstr(profile));
 
-    char temporary[CONTROL_PATH_MAX];
-    snprintf(temporary, sizeof temporary, "%s.tmp", path);
-    static const char body[] =
-        "{\n"
-        "  \"oathpass\": {\n"
-        "    \"host\": \"<IP address>\",\n"
-        "    \"ports\": [\"<port 1>\", \"<port 2>\"],\n"
-        "    \"user\": \"<username>\",\n"
-        "    \"otp\": {\n"
-        "      \"uri\": \"<otpauth://totp/...?secret=...&algorithm=SHA512&digits=8&period=30>\"\n"
-        "    }\n"
-        "  }\n"
-        "}\n";
-    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) die("cannot write %s: %s", temporary, strerror(errno));
-    size_t n = strlen(body);
-    if (write(fd, body, n) != (ssize_t)n) die("cannot write %s", temporary);
-    close(fd);
-    chmod(temporary, 0600);
-    if (rename(temporary, path) != 0) die("cannot move the config into place: %s", strerror(errno));
+    JVal *entry = jnew(J_OBJ);
+    jset(entry, "host", jstr("<IP address>"));
+    JVal *ports = jnew(J_ARR);
+    jpush(ports, NULL, jstr("<port 1>"));
+    jpush(ports, NULL, jstr("<port 2>"));
+    jset(entry, "ports", ports);
+    jset(entry, "user", jstr("<username>"));
+    JVal *otp = jnew(J_OBJ);
+    jset(otp, "uri", jstr("<otpauth://totp/...?secret=...&algorithm=SHA512&digits=8&period=30>"));
+    jset(entry, "otp", otp);
+
+    JVal *profiles = jnew(J_OBJ);
+    jset(profiles, profile, entry);
+    jset(doc, "profiles", profiles);
+
+    store_document(path, root);
 }
 
-static int cmd_init(int force) {
+/* List the profiles, or set/remove one.  Never prints a seed. */
+static int cmd_profiles(int argc, char **argv) {
     const char *path = config_path();
+    const char *set_default = NULL, *remove = NULL;
+
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--default") && i + 1 < argc) set_default = argv[++i];
+        else if (!strncmp(argv[i], "--default=", 10)) set_default = argv[i] + 10;
+        else if (!strcmp(argv[i], "--remove") && i + 1 < argc) remove = argv[++i];
+        else if (!strncmp(argv[i], "--remove=", 9)) remove = argv[i] + 9;
+        else die("profiles takes --default NAME or --remove NAME");
+    }
+
+    if (!set_default && !remove) {
+        JVal *root = load_document(path);
+        JVal *doc = jget(root, "oathpass");
+        if (!doc || (!jget(doc, "profiles") && !jget(doc, "host"))) {
+            printf("no profiles in %s -- run oathpass --init --profile NAME\n", path);
+            return 0;
+        }
+        migrate_flat_profile(doc);
+        char names[32][64];
+        int count = profile_names(doc, names, 32);
+        JVal *def = jget(doc, "default");
+        const char *default_name = (def && def->type == J_STR) ? def->str : "";
+        JVal *profiles = profiles_object(doc, 0);
+        printf("file      %s\n\n", path);
+        printf("%-14s %-24s %s\n", "profile", "target", "ports");
+        for (int i = 0; i < count; i++) {
+            JVal *entry = profiles ? jget(profiles, names[i]) : doc;
+            JVal *host = entry ? jget(entry, "host") : NULL;
+            JVal *user = entry ? jget(entry, "user") : NULL;
+            JVal *ports = entry ? jget(entry, "ports") : NULL;
+            char portlist[128] = "";
+            if (ports && ports->type == J_ARR) {
+                for (size_t k = 0; k < ports->count; k++) {
+                    if (ports->items[k]->type != J_STR) continue;
+                    strncat(portlist, ports->items[k]->str, sizeof portlist - strlen(portlist) - 1);
+                    if (k + 1 < ports->count) strncat(portlist, ",", sizeof portlist - strlen(portlist) - 1);
+                }
+            }
+            char target[300];
+            snprintf(target, sizeof target, "%s@%s", user && user->type == J_STR ? user->str : "?",
+                     host && host->type == J_STR ? host->str : "?");
+            printf("%-14s %-24s %s%s\n", names[i], target, portlist,
+                   !strcmp(names[i], default_name) ? "   (default)" : "");
+        }
+        return 0;
+    }
+
+    JVal *root = load_document(path);
+    JVal *doc = jget(root, "oathpass");
+    if (!doc) die("no \"oathpass\" object in %s", path);
+    migrate_flat_profile(doc);
+    JVal *profiles = profiles_object(doc, 0);
+    char names[32][64];
+    int count = profile_names(doc, names, 32);
+
+    if (set_default) {
+        int found = 0;
+        for (int i = 0; i < count; i++)
+            if (!strcmp(names[i], set_default)) found = 1;
+        if (!found) {
+            char listing[512];
+            join_names(names, count, listing, sizeof listing);
+            die("no profile '%s' -- have: %s", set_default, listing);
+        }
+        jset(doc, "default", jstr(set_default));
+        store_document(path, root);
+        printf("default    %s\n", set_default);
+        return 0;
+    }
+
+    if (!profiles) die("%s holds a single flat profile; --remove would leave nothing", path);
+    if (!jget(profiles, remove)) die("no profile '%s'", remove);
+    if (count <= 1) die("'%s' is the only profile -- removing it would leave nothing", remove);
+    jdel(profiles, remove);
+    JVal *def = jget(doc, "default");
+    if (def && def->type == J_STR && !strcmp(def->str, remove)) {
+        char remaining[32][64];
+        int left = profile_names(doc, remaining, 32);
+        jset(doc, "default", jstr(remaining[0]));
+        (void)left;
+    }
+    store_document(path, root);
+    printf("removed    %s\n", remove);
+    return 0;
+}
+
+static int cmd_init(const char *profile, int force) {
+    const char *path = config_path();
+    if (!profile || !*profile) profile = "default";
+    snprintf(g_profile, sizeof g_profile, "%s", profile);
 
     if (!force && config_ready()) {
         Config cfg;
         load_config(&cfg);
-        printf("oathpass is already configured: %s\n", path);
+        printf("profile %s is already configured: %s\n", cfg.profile, path);
         printf("  host   %s\n  user   %s\n  ports  %s\n", cfg.host, cfg.user, cfg.ports_render);
-        printf("  force  oathpass --init --force rewrites the skeleton\n");
+        printf("  other  oathpass --init --profile NAME adds another profile\n");
         return 0;
     }
 
-    write_skeleton(path);
+    write_skeleton(path, profile);
     print_guide(path);
 
     FILE *tty = open_terminal();
@@ -2314,10 +2617,10 @@ static int cmd_init(int force) {
         return 1;
     }
 
-    write_setup(path, &setup);
+    write_setup(path, profile, &setup);
     wipe(setup.uri, sizeof setup.uri);
 
-    printf("written %s (mode 600)\n", path);
+    printf("written profile %s in %s (mode 600)\n", profile, path);
     Config cfg;
     load_config(&cfg);
     char code[16];
@@ -2353,6 +2656,11 @@ static int usage(void) {
 }
 
 int main(int argc, char **argv) {
+    /* The askpass child is re-entered with the profile exported, so it answers
+       with the same seed its parent used. */
+    const char *env_profile = getenv("OATHPASS_PROFILE");
+    if (env_profile && *env_profile) snprintf(g_profile, sizeof g_profile, "%s", env_profile);
+
     const char *askpass_role = getenv("OATHPASS_ASKPASS");
     if (askpass_role && !strcmp(askpass_role, "1")) return askpass(argc > 1 ? argv[1] : "");
 
@@ -2380,6 +2688,16 @@ int main(int argc, char **argv) {
             index += 2;
             continue;
         }
+        if (!strncmp(argv[index], "--profile=", 10)) {
+            snprintf(g_profile, sizeof g_profile, "%s", argv[index] + 10);
+            index++;
+            continue;
+        }
+        if (!strcmp(argv[index], "--profile") && index + 1 < argc) {
+            snprintf(g_profile, sizeof g_profile, "%s", argv[index + 1]);
+            index += 2;
+            continue;
+        }
         break;
     }
     if (forced_port < 0 || forced_port > 65535) die("--port needs a port number");
@@ -2396,8 +2714,18 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(command, "--help") || !strcmp(command, "-h") || !strcmp(command, "help")) return usage();
     if (!strcmp(command, "--selftest") || !strcmp(command, "selftest")) return cmd_selftest();
-    if (!strcmp(command, "--init") || !strcmp(command, "init"))
-        return cmd_init(restc > 1 && !strcmp(rest[1], "--force"));
+    if (!strcmp(command, "--init") || !strcmp(command, "init")) {
+        int force = 0;
+        const char *profile = g_profile[0] ? g_profile : "default";
+        for (int i = 1; i < restc; i++) {
+            if (!strcmp(rest[i], "--force")) force = 1;
+            else if (!strncmp(rest[i], "--profile=", 10)) profile = rest[i] + 10;
+            else if (!strcmp(rest[i], "--profile") && i + 1 < restc) profile = rest[++i];
+            else die("init takes only --profile NAME and --force");
+        }
+        return cmd_init(profile, force);
+    }
+    if (!strcmp(command, "profiles")) return cmd_profiles(restc - 1, rest + 1);
 
     static const char *const with_config[] = {
         "otp", "target", "doctor", "wrap", "port", "check", "--dry-run",
@@ -2406,7 +2734,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; with_config[i]; i++)
         if (!strcmp(command, with_config[i])) known = 1;
     if (known) {
-        if (!config_ready()) return cmd_init(0);
+        if (!config_ready()) return cmd_init(NULL, 0);
         Config cfg;
         load_config(&cfg);
         if (!strcmp(command, "otp")) return cmd_otp(&cfg, restc - 1, rest + 1);
@@ -2425,7 +2753,7 @@ int main(int argc, char **argv) {
         return cmd_wrap(&cfg, restc - 1, rest + 1);
     }
 
-    if (!config_ready()) return cmd_init(0);
+    if (!config_ready()) return cmd_init(NULL, 0);
     Config cfg;
     load_config(&cfg);
     return cmd_login(&cfg, rest, forced_node, forced_port);

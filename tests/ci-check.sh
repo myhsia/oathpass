@@ -56,7 +56,7 @@ bad() { fail=$((fail + 1)); printf '  FAIL %-38s %s\n' "$1" "${2:-}"; }
 # install <fixture|missing> -- place (or remove) the config for the next call
 use_config() {
     rm -f "$CONFIG"
-    [ "$1" = missing ] || cp "$1" "$CONFIG"
+    [ "$1" = missing ] || { cp "$1" "$CONFIG" && chmod 600 "$CONFIG"; }
 }
 
 # expect <exit-code> <description> <fixture> <args...>
@@ -154,6 +154,50 @@ done
 expect 1 "run guides with no config"    missing run ls
 expect 0 "init says already configured" "$TMP/valid.json" --init
 expect 1 "init --force rewrites"        "$TMP/valid.json" --init --force
+
+# Profiles: several (campus, user) pairs in one file, selected by flag, env or
+# the file's own default.
+PROFILES="$TMP/profiles.json"
+cat >"$PROFILES" <<EOF
+{"oathpass": {"default": "Alpha", "keep_me": {"nested": 7},
+  "profiles": {
+    "Alpha": {"host": "10.0.0.1", "ports": ["2201"], "user": "alice",
+              "otp": {"uri": "otpauth://totp/a?secret=$SEED&algorithm=SHA512&digits=8&period=30"}},
+    "Beta":  {"host": "10.0.0.2", "ports": ["2201"], "user": "bob",
+              "otp": {"uri": "otpauth://totp/b?secret=$SEED&algorithm=SHA256&digits=6&period=30"}}
+  }}}
+EOF
+
+use_config "$PROFILES"
+[ "$("$BIN" target)" = "alice@10.0.0.1" ] && ok "default profile" || bad "default profile"
+[ "$("$BIN" --profile Beta target)" = "bob@10.0.0.2" ] && ok "--profile selects" || bad "--profile selects"
+[ "$(OATHPASS_PROFILE=Beta "$BIN" target)" = "bob@10.0.0.2" ] && ok "OATHPASS_PROFILE selects" || bad "OATHPASS_PROFILE selects"
+[ "$(OATHPASS_PROFILE=Beta "$BIN" --profile Alpha target)" = "alice@10.0.0.1" ] \
+    && ok "the flag beats the env" || bad "the flag beats the env"
+# the seed is shared; the algorithm and digits are not
+[ "$("$BIN" --profile Alpha otp --at 59)" = "90693936" ] && ok "Alpha is SHA512/8" || bad "Alpha is SHA512/8"
+[ "$("$BIN" --profile Beta otp --at 59)" = "786473" ] && ok "Beta is SHA256/6" || bad "Beta is SHA256/6"
+"$BIN" --profile Nope target >/dev/null 2>&1 && bad "unknown profile is refused" || ok "unknown profile is refused"
+
+use_config "$PROFILES"
+"$BIN" profiles | grep -q "Alpha.*alice@10.0.0.1.*default" && ok "profiles lists the default" || bad "profiles lists the default"
+"$BIN" profiles --default Beta >/dev/null 2>&1 && [ "$("$BIN" target)" = "bob@10.0.0.2" ] \
+    && ok "profiles --default moves it" || bad "profiles --default moves it"
+# a rewrite must keep keys this program does not model
+grep -q '"keep_me"' "$CONFIG" && grep -q '"nested"' "$CONFIG" \
+    && ok "unknown keys survive a rewrite" || bad "unknown keys survive a rewrite"
+"$BIN" profiles --remove Alpha >/dev/null 2>&1 && [ "$("$BIN" profiles | grep -c '^[A-Za-z]')" -ge 1 ] \
+    && ok "profiles --remove drops one" || bad "profiles --remove drops one"
+"$BIN" profiles --remove Beta >/dev/null 2>&1 && bad "the last profile is protected" || ok "the last profile is protected"
+
+# A file written before profiles existed still works, and is migrated on write.
+LEGACY="$TMP/legacy.json"
+printf '{"oathpass": {"host": "10.0.0.9", "ports": ["2201"], "user": "legacy", "otp": {"uri": "otpauth://totp/l?secret=%s"}}}\n' \
+    "$SEED" >"$LEGACY"
+use_config "$LEGACY"
+[ "$("$BIN" target)" = "legacy@10.0.0.9" ] && ok "a flat config still loads" || bad "a flat config still loads"
+"$BIN" profiles --default default >/dev/null 2>&1 && grep -q '"profiles"' "$CONFIG" \
+    && ok "a flat config migrates on write" || bad "a flat config migrates on write"
 
 # The help text must name the tool and advertise the selftest.
 use_config missing

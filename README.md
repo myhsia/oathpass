@@ -61,6 +61,33 @@ $ make check            # install, then selftest and PATH check
 The build output is the command: no interpreter, no wrapper script, no
 bytecode cache. `oathpass --version` prints the release.
 
+## Profiles: more than one cluster
+
+One file can hold several `(cluster, user)` profiles, and the tool picks one by
+`--profile NAME`, then `$OATHPASS_PROFILE`, then the file's own `default`:
+
+```json
+{ "oathpass": { "default": "Yunqi",
+                "profiles": { "Yunqi": { "host": "…", "ports": ["…"], "user": "…", "otp": { "uri": "…" } },
+                              "Yungu": { "host": "…", "ports": ["…"], "user": "…", "otp": { "uri": "…" } } } } }
+```
+
+```console
+$ oathpass profiles                      # names, targets, ports; never a seed
+$ oathpass --profile Yungu otp           # that profile's code
+$ oathpass --profile Yungu               # log in to the other campus
+$ oathpass profiles --default Yungu      # make it the default
+$ oathpass profiles --remove Yungu       # drop it (the last one is protected)
+$ oathpass --init --profile Yungu        # add one, guided, URI hidden
+```
+
+Each profile has its own master socket (`control-<profile>-<port>`), so two
+campuses that happen to use the same port number never share a connection; the
+askpass child inherits the profile, so it always answers with the same seed the
+parent used. A file written before profiles existed is read as the single
+profile `default` and migrated on the next write, and keys this tool does not
+model survive every rewrite.
+
 ## First run
 
 `oathpass` and any command that needs a config print a numbered guide and leave

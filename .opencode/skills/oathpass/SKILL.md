@@ -20,6 +20,16 @@ it: `VERSION` bumped, tag `v<VERSION>` pushed, the workflow green on all five
 targets, and `install.sh` able to fetch the new asset. `make install` is a
 development shortcut; the binary in `~/.local/bin` comes from a release.
 
+## Profiles
+
+One config file, several `(cluster, user)` profiles.  When touching config code, keep two
+invariants: the socket is `control-<profile>-<port>` (two campuses on one port must not share a
+master) and `OATHPASS_PROFILE` is exported to the askpass child (it must answer with its parent's
+seed, not the default profile's).  The config writer walks the parsed JSON tree, not the `Config`
+struct, so keys the tool does not model survive a rewrite — do not replace it with field-by-field
+printing.  `tests/ci-check.sh` covers precedence, the two invariants, the legacy flat file and
+unknown-key survival.
+
 ## Before changing code
 
 - Read `src/oathpass.c`'s header comment: it states the model (single-use code,
