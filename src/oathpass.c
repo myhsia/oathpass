@@ -2290,6 +2290,50 @@ static void store_document(const char *path, JVal *root) {
     if (rename(temporary, path) != 0) die("cannot move the config into place: %s", strerror(errno));
 }
 
+static int any_placeholder(const JVal *v) {
+    if (!v) return 0;
+    switch (v->type) {
+    case J_STR: return is_placeholder(v->str);
+    case J_ARR:
+        for (size_t i = 0; i < v->count; i++)
+            if (any_placeholder(v->items[i])) return 1;
+        return 0;
+    case J_OBJ:
+        for (size_t i = 0; i < v->count; i++)
+            if (any_placeholder(v->items[i])) return 1;
+        return 0;
+    default: return 0;
+    }
+}
+
+/* The config's own default profile name, or NULL. */
+static const char *document_default_profile(void) {
+    struct stat st;
+    if (stat(config_path(), &st) != 0) return NULL;
+    JVal *root = load_document(config_path());
+    JVal *doc = jget(root, "oathpass");
+    if (!doc) return NULL;
+    JVal *profiles = profiles_object(doc, 0);
+    if (!profiles) return "default";
+    JVal *def = jget(doc, "default");
+    if (def && def->type == J_STR && def->str[0]) return def->str;
+    return profiles->count == 1 ? profiles->keys[0] : NULL;
+}
+
+/* Is this particular profile complete?  A second profile must not be blocked by
+   the first one being ready. */
+static int profile_ready(const char *name) {
+    struct stat st;
+    if (stat(config_path(), &st) != 0) return 0;
+    JVal *root = load_document(config_path());
+    JVal *doc = jget(root, "oathpass");
+    if (!doc) return 0;
+    JVal *profiles = profiles_object(doc, 0);
+    JVal *entry = profiles ? jget(profiles, name) : doc;
+    if (!entry || entry->type != J_OBJ) return 0;
+    return !any_placeholder(entry);
+}
+
 static int config_ready(void) {
     FILE *f = fopen(config_path(), "rb");
     if (!f) return 0;
@@ -2557,10 +2601,11 @@ static int cmd_profiles(int argc, char **argv) {
 
 static int cmd_init(const char *profile, int force) {
     const char *path = config_path();
+    if (!profile || !*profile) profile = document_default_profile();
     if (!profile || !*profile) profile = "default";
     snprintf(g_profile, sizeof g_profile, "%s", profile);
 
-    if (!force && config_ready()) {
+    if (!force && profile_ready(profile)) {
         Config cfg;
         load_config(&cfg);
         printf("profile %s is already configured: %s\n", cfg.profile, path);
@@ -2716,7 +2761,7 @@ int main(int argc, char **argv) {
     if (!strcmp(command, "--selftest") || !strcmp(command, "selftest")) return cmd_selftest();
     if (!strcmp(command, "--init") || !strcmp(command, "init")) {
         int force = 0;
-        const char *profile = g_profile[0] ? g_profile : "default";
+        const char *profile = g_profile[0] ? g_profile : NULL;
         for (int i = 1; i < restc; i++) {
             if (!strcmp(rest[i], "--force")) force = 1;
             else if (!strncmp(rest[i], "--profile=", 10)) profile = rest[i] + 10;

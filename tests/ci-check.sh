@@ -199,6 +199,14 @@ use_config "$LEGACY"
 "$BIN" profiles --default default >/dev/null 2>&1 && grep -q '"profiles"' "$CONFIG" \
     && ok "a flat config migrates on write" || bad "a flat config migrates on write"
 
+# A second profile is not blocked by the first being complete, and a plain
+# --init speaks about the profile that exists.
+use_config "$PROFILES"
+"$BIN" --init 2>&1 | grep -q "profile Alpha is already configured" \
+    && ok "init reports the existing profile" || bad "init reports the existing profile"
+"$BIN" --init --profile Third 2>&1 | grep -q "Fill in four things" \
+    && ok "init can add a second profile" || bad "init can add a second profile"
+
 # The help text must name the tool and advertise the selftest.
 use_config missing
 help=$("$BIN" --help 2>&1)
