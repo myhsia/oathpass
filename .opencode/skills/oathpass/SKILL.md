@@ -53,6 +53,18 @@ make && make test && sh tests/ci-check.sh ./oathpass
   buffers with `%s` sources of known range; build them from `getenv` results
   and check the return value.
 
+## Memory and options
+
+Two conventions this repository settled on, both enforced by review rather than
+by a linter:
+
+- every string and tree node comes from the arena (`amalloc`, `astrdup`,
+  `aprintf`, `astrcat`) and is freed once by `arena_reset`; a `malloc`, `free`
+  or `snprintf`-into-a-buffer is a regression.  `leaks --atExit -- ./oathpass
+  profiles` must report `0 leaks`.
+- options go through `opt_value(argc, argv, "--name", &index, &value)`, which
+  understands both spellings; adding a parser by hand is a regression.
+
 ## Adding a command
 
 1. Add the mode to `usage()`, the header comment, and the `with_config` list in

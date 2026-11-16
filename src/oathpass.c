@@ -104,6 +104,8 @@ static char g_time_url[256] = "https://1.1.1.1";
 
 /* ------------------------------------------------------------------ output */
 
+static void arena_reset(void);
+
 static void die(const char *fmt, ...) {
     va_list ap;
     fputs("oathpass: ", stderr);
@@ -111,6 +113,7 @@ static void die(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+    arena_reset();
     exit(1);
 }
 
@@ -121,6 +124,80 @@ static void note(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+
+/* ---------------------------------------------------------------- arena
+ * Everything the JSON layer and the path/argv builders allocate comes from one
+ * arena, so releasing it is a single call: this program has no long-lived
+ * object that outlives a command.
+ */
+
+typedef struct ArenaBlock {
+    struct ArenaBlock *next;
+    size_t used;
+    size_t cap;
+    char *data;
+} ArenaBlock;
+
+static ArenaBlock *g_arena;
+
+#define ARENA_BLOCK (64 * 1024)
+
+static void *amalloc(size_t size) {
+    size = (size + 15) & ~(size_t)15; /* keep 16-byte alignment */
+    if (!g_arena || g_arena->used + size > g_arena->cap) {
+        size_t cap = size > ARENA_BLOCK ? size : ARENA_BLOCK;
+        ArenaBlock *block = calloc(1, sizeof *block);
+        if (!block) die("out of memory");
+        block->data = calloc(1, cap);
+        if (!block->data) die("out of memory");
+        block->cap = cap;
+        block->next = g_arena;
+        g_arena = block;
+    }
+    void *out = g_arena->data + g_arena->used;
+    g_arena->used += size;
+    return out;
+}
+
+static void arena_reset(void) {
+    while (g_arena) {
+        ArenaBlock *next = g_arena->next;
+        free(g_arena->data);
+        free(g_arena);
+        g_arena = next;
+    }
+}
+
+static char *astrdup(const char *text) {
+    if (!text) text = "";
+    size_t n = strlen(text);
+    char *out = amalloc(n + 1);
+    memcpy(out, text, n + 1);
+    return out;
+}
+
+/* Concatenate onto an arena string, returning the (possibly new) result. */
+static char *astrcat(const char *head, const char *tail) {
+    size_t a = head ? strlen(head) : 0, b = tail ? strlen(tail) : 0;
+    char *out = amalloc(a + b + 1);
+    if (a) memcpy(out, head, a);
+    if (b) memcpy(out + a, tail, b);
+    out[a + b] = '\0';
+    return out;
+}
+
+static char *aprintf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) die("cannot format a string");
+    char *out = amalloc((size_t)needed + 1);
+    va_start(ap, fmt);
+    vsnprintf(out, (size_t)needed + 1, fmt, ap);
+    va_end(ap);
+    return out;
 }
 
 /* -------------------------------------------------------------------- JSON */
@@ -145,8 +222,8 @@ typedef struct {
 static JVal *jparse_value(JParser *jp);
 
 static JVal *jnew(JType type) {
-    JVal *v = calloc(1, sizeof *v);
-    if (!v) die("out of memory");
+    JVal *v = amalloc(sizeof *v);
+    memset(v, 0, sizeof *v);
     v->type = type;
     return v;
 }
@@ -163,9 +240,11 @@ static void jexpect(JParser *jp, char want) {
 
 static void jpad(char **buf, size_t *len, size_t *cap, char c) {
     if (*len + 2 > *cap) {
-        *cap = *cap ? *cap * 2 : 32;
-        *buf = realloc(*buf, *cap);
-        if (!*buf) die("out of memory");
+        size_t grown = *cap ? *cap * 2 : 64;
+        char *moved = amalloc(grown);
+        if (*len) memcpy(moved, *buf, *len);
+        *buf = moved;
+        *cap = grown;
     }
     (*buf)[(*len)++] = c;
     (*buf)[*len] = '\0';
@@ -239,20 +318,21 @@ static char *jparse_string(JParser *jp) {
     if (*jp->p != '"') die("unterminated JSON string");
     jp->p++;
     if (!buf) {
-        buf = malloc(1);
-        if (!buf) die("out of memory");
-        buf[0] = '\0';
+        buf = astrdup("");
     }
     return buf;
 }
 
 static void jpush(JVal *v, char *key, JVal *item) {
-    v->items = realloc(v->items, (v->count + 1) * sizeof *v->items);
-    if (!v->items) die("out of memory");
+    size_t n = v->count + 1;
+    JVal **items = amalloc(n * sizeof *items);
+    if (v->count) memcpy(items, v->items, v->count * sizeof *items);
+    v->items = items;
     if (v->type == J_OBJ) {
-        v->keys = realloc(v->keys, (v->count + 1) * sizeof *v->keys);
-        if (!v->keys) die("out of memory");
-        v->keys[v->count] = key;
+        char **keys = amalloc(n * sizeof *keys);
+        if (v->count) memcpy(keys, v->keys, v->count * sizeof *keys);
+        keys[v->count] = key;
+        v->keys = keys;
     }
     v->items[v->count++] = item;
 }
@@ -794,8 +874,7 @@ static char *slurp(const char *path) {
     long size = ftell(f);
     if (size < 0) die("cannot read %s", path);
     rewind(f);
-    char *buf = malloc((size_t)size + 1);
-    if (!buf) die("out of memory");
+    char *buf = amalloc((size_t)size + 1);
     size_t got = fread(buf, 1, (size_t)size, f);
     buf[got] = '\0';
     fclose(f);
@@ -834,8 +913,7 @@ static void parse_otpauth(const char *uri, Token *tok, char *secret, size_t secr
     const char *query = strchr(uri, '?');
     if (!query) die("oathpass.otp.uri has no query string");
     if (strncmp(uri, "otpauth://", 10) != 0) die("oathpass.otp.uri is not an otpauth:// URI");
-    char *copy = strdup(query + 1);
-    if (!copy) die("out of memory");
+    char *copy = astrdup(query + 1);
     for (char *pair = strtok(copy, "&"); pair; pair = strtok(NULL, "&")) {
         char *eq = strchr(pair, '=');
         if (!eq) continue;
@@ -844,7 +922,38 @@ static void parse_otpauth(const char *uri, Token *tok, char *secret, size_t secr
         percent_decode(value);
         take_query_value(pair, value, tok, have_secret, secret, secret_sz);
     }
-    free(copy);
+}
+
+
+
+/* ------------------------------------------------------------- options
+ * One place that understands `--name value` and `--name=value`, so the four
+ * parsers stop repeating both spellings.
+ */
+
+/* Take `--name VALUE` or `--name=VALUE` at argv[*index]; advances past it. */
+static int opt_value(int argc, char **argv, const char *name, int *index, const char **value) {
+    const char *item = argv[*index];
+    size_t len = strlen(name);
+    if (!strncmp(item, name, len) && item[len] == '=') {
+        *value = item + len + 1;
+        (*index)++;
+        return 1;
+    }
+    if (!strcmp(item, name) && *index + 1 < argc) {
+        *value = argv[*index + 1];
+        *index += 2;
+        return 1;
+    }
+    return 0;
+}
+
+/* Take a bare flag at argv[*index]. */
+static int opt_flag(int argc, char **argv, const char *name, int *index) {
+    (void)argc;
+    if (strcmp(argv[*index], name)) return 0;
+    (*index)++;
+    return 1;
 }
 
 
@@ -856,8 +965,7 @@ static void parse_otpauth(const char *uri, Token *tok, char *secret, size_t secr
 
 static JVal *jstr(const char *text) {
     JVal *value = jnew(J_STR);
-    value->str = strdup(text ? text : "");
-    if (!value->str) die("out of memory");
+    value->str = astrdup(text);
     return value;
 }
 
@@ -869,7 +977,7 @@ static void jset(JVal *obj, const char *key, JVal *value) {
             obj->items[i] = value;
             return;
         }
-    jpush(obj, strdup(key), value);
+    jpush(obj, astrdup(key), value);
 }
 
 static void jdel(JVal *obj, const char *key) {
@@ -1468,26 +1576,27 @@ static void mkdir_p(const char *path) {
     mkdir(tmp, 0700);
 }
 
-static void control_path(const char *profile, int port, char out[CONTROL_PATH_MAX]) {
-    const char *cache = getenv("XDG_CACHE_HOME");
-    const char *home = getenv("HOME");
-    int written;
-    if (cache && *cache) {
-        written = snprintf(out, CONTROL_PATH_MAX, "%s/oathpass/control-%s-%d", cache, profile, port);
-    } else {
-        if (!home) die("HOME is not set");
-        written = snprintf(out, CONTROL_PATH_MAX, "%s/.cache/oathpass/control-%s-%d", home,
-                           profile, port);
-    }
-    if (written < 0 || (size_t)written >= CONTROL_PATH_MAX) die("the control socket path is too long");
-
-    char dir[CONTROL_PATH_MAX];
-    size_t len = strlen(out);
-    memcpy(dir, out, len + 1);
+static void ensure_parent_dir(const char *path) {
+    char *dir = astrdup(path);
     char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0';
+    if (!slash) return;
+    *slash = '\0';
     mkdir_p(dir);
     chmod(dir, 0700);
+}
+
+static char *control_path(const char *profile, int port) {
+    const char *cache = getenv("XDG_CACHE_HOME");
+    const char *home = getenv("HOME");
+    char *path;
+    if (cache && *cache) {
+        path = aprintf("%s/oathpass/control-%s-%d", cache, profile, port);
+    } else {
+        if (!home) die("HOME is not set");
+        path = aprintf("%s/.cache/oathpass/control-%s-%d", home, profile, port);
+    }
+    ensure_parent_dir(path);
+    return path;
 }
 
 static void set_askpass_env(const char *profile) {
@@ -1539,20 +1648,20 @@ static int master_exit(const char *sock, int port, const Config *cfg) {
 /* Open the master if it is not already up.  This is the only place an OTP is
    spent.  Returns 0 on success; `sock` and `port` come back filled in. */
 static int ensure_master(const Config *cfg, int forced_index, int forced_port,
-                         char sock[CONTROL_PATH_MAX], int *port_out) {
+                         const char **sock_out, int *port_out) {
     Node nodes[16];
     int count = select_nodes(cfg, forced_index, forced_port, nodes, 16, NULL, NULL);
     if (count == -2) die("--node %d is out of range (1..%zu)", forced_index, cfg->nports);
     if (count < 0) return report_no_network(cfg, forced_index, forced_port);
 
     int port = nodes[0].port;
-    control_path(cfg->profile, port, sock);
+    const char *sock = control_path(cfg->profile, port);
+    if (sock_out) *sock_out = sock;
     if (port_out) *port_out = port;
     if (master_alive(sock, port, cfg)) return 0;
 
-    char portbuf[16], target[600];
-    snprintf(portbuf, sizeof portbuf, "%d", port);
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
+    const char *portbuf = aprintf("%d", port);
+    const char *target = aprintf("%s@%s", cfg->user, cfg->host);
 
     int attempts = 0;
     for (;;) {
@@ -1562,7 +1671,7 @@ static int ensure_master(const Config *cfg, int forced_index, int forced_port,
         slots[i++] = "ssh";
         slots[i++] = "-M";
         slots[i++] = "-S";
-        slots[i++] = sock;
+        slots[i++] = (char *)sock;
         slots[i++] = "-fN";
         slots[i++] = "-o";
         slots[i++] = "PreferredAuthentications=keyboard-interactive";
@@ -1577,8 +1686,8 @@ static int ensure_master(const Config *cfg, int forced_index, int forced_port,
         slots[i++] = "-o";
         slots[i++] = "ControlPersist=yes";
         slots[i++] = "-p";
-        slots[i++] = portbuf;
-        slots[i++] = target;
+        slots[i++] = (char *)portbuf;
+        slots[i++] = (char *)target;
         slots[i] = NULL;
 
         set_askpass_env(cfg->profile);
@@ -1648,8 +1757,7 @@ static int arg_safe(const char *arg) {
 
 static char *single_quote(const char *text) {
     size_t n = strlen(text);
-    char *out = malloc(n + 3);
-    if (!out) die("out of memory");
+    char *out = amalloc(n + 3);
     out[0] = '\'';
     memcpy(out + 1, text, n);
     out[n + 1] = '\'';
@@ -1674,35 +1782,28 @@ static int cmd_run(const Config *cfg, int forced_index, int forced_port, int arg
                     die("refusing %s: find may not run or write anything", argv[i]);
     }
 
-    char sock[CONTROL_PATH_MAX];
+    const char *sock = NULL;
     int port = 0;
-    int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
+    int rc = ensure_master(cfg, forced_index, forced_port, &sock, &port);
     if (rc) return rc;
 
-    size_t size = 64;
-    for (int i = 0; i < argc; i++) size += strlen(argv[i]) * 4 + 8;
-    char *remote = malloc(size);
-    if (!remote) die("out of memory");
-    snprintf(remote, size, "cd ~ && exec");
+    char *remote = astrdup("cd ~ && exec");
     for (int i = 0; i < argc; i++) {
-        char *quoted = single_quote(argv[i]);
-        strncat(remote, " ", size - strlen(remote) - 1);
-        strncat(remote, quoted, size - strlen(remote) - 1);
-        free(quoted);
+        remote = astrcat(remote, " ");
+        remote = astrcat(remote, single_quote(argv[i]));
     }
 
-    char portbuf[16], target[600];
-    snprintf(portbuf, sizeof portbuf, "%d", port);
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
+    const char *portbuf = aprintf("%d", port);
+    const char *target = aprintf("%s@%s", cfg->user, cfg->host);
     char *slots[16];
     memset(slots, 0, sizeof slots);
     slots[0] = "ssh";
     slots[1] = "-S";
-    slots[2] = sock;
+    slots[2] = (char *)sock;
     slots[3] = "-p";
-    slots[4] = portbuf;
+    slots[4] = (char *)portbuf;
     slots[5] = "-T";
-    slots[6] = target;
+    slots[6] = (char *)target;
     slots[7] = remote;
     slots[8] = NULL;
 
@@ -1759,13 +1860,14 @@ static void sftp_check_line(const char *line, int number) {
 
 static char *read_all(FILE *stream) {
     size_t cap = 8192, len = 0;
-    char *buf = malloc(cap);
-    if (!buf) die("out of memory");
+    char *buf = amalloc(cap);
     for (;;) {
         if (len + 4097 > cap) {
-            cap *= 2;
-            buf = realloc(buf, cap);
-            if (!buf) die("out of memory");
+            size_t grown = cap * 2;
+            char *moved = amalloc(grown);
+            memcpy(moved, buf, len);
+            buf = moved;
+            cap = grown;
         }
         size_t got = fread(buf + len, 1, 4096, stream);
         len += got;
@@ -1811,29 +1913,28 @@ static int cmd_sftp(const Config *cfg, int forced_index, int forced_port, int ar
     if (length && write(fd, text, length) != (ssize_t)length) die("cannot write the batch file");
     close(fd);
 
-    char sock[CONTROL_PATH_MAX];
+    const char *sock = NULL;
     int port = 0;
-    int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
+    int rc = ensure_master(cfg, forced_index, forced_port, &sock, &port);
     if (rc) {
         unlink(template_path);
         return rc;
     }
 
-    char portbuf[16], target[600], control[CONTROL_PATH_MAX + 16];
-    snprintf(portbuf, sizeof portbuf, "%d", port);
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
-    snprintf(control, sizeof control, "ControlPath=%s", sock);
+    const char *portbuf = aprintf("%d", port);
+    const char *target = aprintf("%s@%s", cfg->user, cfg->host);
+    const char *control = aprintf("ControlPath=%s", sock);
 
     char *slots[16];
     memset(slots, 0, sizeof slots);
     slots[0] = "sftp";
     slots[1] = "-o";
-    slots[2] = control;
+    slots[2] = (char *)control;
     slots[3] = "-P";
-    slots[4] = portbuf;
+    slots[4] = (char *)portbuf;
     slots[5] = "-b";
     slots[6] = template_path;
-    slots[7] = target;
+    slots[7] = (char *)target;
     slots[8] = NULL;
 
     pid_t pid = fork();
@@ -1857,35 +1958,29 @@ static int cmd_scp(const Config *cfg, int forced_index, int forced_port, int arg
                 argv[k]);
     if (argc < 2) die("scp needs operands, e.g. oathpass scp local.txt :dest/");
 
-    char sock[CONTROL_PATH_MAX];
+    const char *sock = NULL;
     int port = 0;
-    int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
+    int rc = ensure_master(cfg, forced_index, forced_port, &sock, &port);
     if (rc) return rc;
 
-    char portbuf[16], control[4200];
-    char target[600];
-    char prefix[700];
-    snprintf(portbuf, sizeof portbuf, "%d", port);
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
-    snprintf(prefix, sizeof prefix, "%s:", target);
-    snprintf(control, sizeof control, "ControlPath=%s", sock);
+    const char *portbuf = aprintf("%d", port);
+    const char *target = aprintf("%s@%s", cfg->user, cfg->host);
+    const char *prefix = aprintf("%s:", target);
+    const char *control = aprintf("ControlPath=%s", sock);
 
     char *slots[64];
     memset(slots, 0, sizeof slots);
     size_t i = 0;
     slots[i++] = "scp";
     slots[i++] = "-o";
-    slots[i++] = control;
+    slots[i++] = (char *)control;
     slots[i++] = "-P";
-    slots[i++] = portbuf;
+    slots[i++] = (char *)portbuf;
     /* ":path" is shorthand for "<user>@<host>:path", so the host is never
        typed and never has to match a stale copy. */
     for (int k = 0; k < argc && i < 58; k++) {
         if (argv[k][0] == ':' && argv[k][1]) {
-            char *joined = malloc(strlen(prefix) + strlen(argv[k]) + 1);
-            if (!joined) die("out of memory");
-            sprintf(joined, "%s%s", prefix, argv[k] + 1);
-            slots[i++] = joined;
+            slots[i++] = aprintf("%s%s", prefix, argv[k] + 1);
         } else {
             slots[i++] = argv[k];
         }
@@ -1912,9 +2007,9 @@ static int cmd_rsync(const Config *cfg, int forced_index, int forced_port, int a
     }
     if (argc < 2) die("rsync needs operands, e.g. oathpass rsync -av ./data/ :dest/");
 
-    char sock[CONTROL_PATH_MAX];
+    const char *sock = NULL;
     int port = 0;
-    int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
+    int rc = ensure_master(cfg, forced_index, forced_port, &sock, &port);
     if (rc) return rc;
 
     char portbuf[16], target[600], rsh[4200], prefix[700];
@@ -1931,10 +2026,7 @@ static int cmd_rsync(const Config *cfg, int forced_index, int forced_port, int a
     slots[i++] = rsh;
     for (int k = 0; k < argc && i < 60; k++) {
         if (argv[k][0] == ':' && argv[k][1]) {
-            char *joined = malloc(strlen(prefix) + strlen(argv[k]) + 1);
-            if (!joined) die("out of memory");
-            sprintf(joined, "%s%s", prefix, argv[k] + 1);
-            slots[i++] = joined;
+            slots[i++] = aprintf("%s%s", prefix, argv[k] + 1);
         } else {
             slots[i++] = argv[k];
         }
@@ -1953,8 +2045,7 @@ static int cmd_status(const Config *cfg, int forced_index, int forced_port) {
     if (count < 0) return report_no_network(cfg, forced_index, forced_port);
 
     int port = nodes[0].port;
-    char sock[CONTROL_PATH_MAX];
-    control_path(cfg->profile, port, sock);
+    const char *sock = control_path(cfg->profile, port);
     printf("node     %d of %zu, port %d\n", nodes[0].index + 1, cfg->nports, port);
     printf("master   %s\n", master_alive(sock, port, cfg) ? "connected" : "not connected (the next command opens it)");
     printf("socket   %s\n", sock);
@@ -1962,9 +2053,9 @@ static int cmd_status(const Config *cfg, int forced_index, int forced_port) {
 }
 
 static int cmd_sockpath(const Config *cfg, int forced_index, int forced_port) {
-    char sock[CONTROL_PATH_MAX];
+    const char *sock = NULL;
     int port = 0;
-    int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
+    int rc = ensure_master(cfg, forced_index, forced_port, &sock, &port);
     if (rc) return rc;
     printf("%s\n", sock);
     return 0;
@@ -1974,8 +2065,7 @@ static int cmd_close(const Config *cfg, int forced_port) {
     int closed = 0;
     for (size_t i = 0; i < cfg->nports; i++) {
         int port = forced_port ? forced_port : cfg->ports[i];
-        char sock[CONTROL_PATH_MAX];
-        control_path(cfg->profile, port, sock);
+        const char *sock = control_path(cfg->profile, port);
         if (!master_alive(sock, port, cfg)) continue;
         if (master_exit(sock, port, cfg)) {
             printf("closed port %d\n", port);
@@ -1988,25 +2078,24 @@ static int cmd_close(const Config *cfg, int forced_port) {
 }
 
 static int cmd_login(const Config *cfg, char **userargs, int forced_index, int forced_port) {
-    char sock[CONTROL_PATH_MAX];
+    const char *sock = NULL;
     int port = 0;
-    int rc = ensure_master(cfg, forced_index, forced_port, sock, &port);
+    int rc = ensure_master(cfg, forced_index, forced_port, &sock, &port);
     if (rc) return rc;
 
-    char portbuf[16], target[600];
-    snprintf(portbuf, sizeof portbuf, "%d", port);
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
+    const char *portbuf = aprintf("%d", port);
+    const char *target = aprintf("%s@%s", cfg->user, cfg->host);
 
     char *slots[64];
     memset(slots, 0, sizeof slots);
     size_t i = 0;
     slots[i++] = "ssh";
     slots[i++] = "-S";
-    slots[i++] = sock;
+    slots[i++] = (char *)sock;
     slots[i++] = "-p";
-    slots[i++] = portbuf;
+    slots[i++] = (char *)portbuf;
     slots[i++] = isatty(STDIN_FILENO) ? "-t" : "-T";
-    slots[i++] = target;
+    slots[i++] = (char *)target;
     for (char **extra = userargs; extra && *extra && i < 60; extra++) slots[i++] = *extra;
     slots[i] = NULL;
 
@@ -2018,12 +2107,11 @@ static int cmd_login(const Config *cfg, char **userargs, int forced_index, int f
 
 static int cmd_otp(const Config *cfg, int argc, char **argv) {
     double at = -1;
-    for (int i = 0; i < argc; i++) {
-        if (!strcmp(argv[i], "--at") && i + 1 < argc) {
-            at = atof(argv[++i]);
-        } else {
-            die("otp takes only --at EPOCH");
-        }
+    int i = 0;
+    while (i < argc) {
+        const char *value = NULL;
+        if (opt_value(argc, argv, "--at", &i, &value)) at = atof(value);
+        else die("otp takes only --at EPOCH");
     }
     char code[16];
     if (at >= 0) code_at(&cfg->token, at, code, sizeof code);
@@ -2055,8 +2143,7 @@ static int cmd_check(const Config *cfg, int forced_index, int forced_port) {
     if (count < 0) return report_no_network(cfg, forced_index, forced_port);
 
     int port = nodes[0].port;
-    char sock[CONTROL_PATH_MAX];
-    control_path(cfg->profile, port, sock);
+    const char *sock = control_path(cfg->profile, port);
 
     double now = monotime();
     char code[16];
@@ -2341,7 +2428,6 @@ static int config_ready(void) {
     fclose(f);
     int ready = !(strstr(text, "<IP address>") || strstr(text, "<username>") ||
                   strstr(text, "<port") || strstr(text, "<otpauth"));
-    free(text);
     return ready;
 }
 
@@ -2385,8 +2471,7 @@ static int uri_usable(const char *uri) {
     char algorithm[16] = "SHA512";
     int digits = 8;
     double period = 30.0;
-    char *copy = strdup(query + 1);
-    if (!copy) die("out of memory");
+    char *copy = astrdup(query + 1);
     for (char *pair = strtok(copy, "&"); pair; pair = strtok(NULL, "&")) {
         char *eq = strchr(pair, '=');
         if (!eq) continue;
@@ -2398,7 +2483,6 @@ static int uri_usable(const char *uri) {
         else if (!strcmp(pair, "digits")) digits = atoi(value);
         else if (!strcmp(pair, "period")) period = atof(value);
     }
-    free(copy);
 
     if (!secret[0]) return 0;
     unsigned char key[512];
@@ -2515,11 +2599,11 @@ static int cmd_profiles(int argc, char **argv) {
     const char *path = config_path();
     const char *set_default = NULL, *remove = NULL;
 
-    for (int i = 0; i < argc; i++) {
-        if (!strcmp(argv[i], "--default") && i + 1 < argc) set_default = argv[++i];
-        else if (!strncmp(argv[i], "--default=", 10)) set_default = argv[i] + 10;
-        else if (!strcmp(argv[i], "--remove") && i + 1 < argc) remove = argv[++i];
-        else if (!strncmp(argv[i], "--remove=", 9)) remove = argv[i] + 9;
+    int i = 0;
+    while (i < argc) {
+        const char *value = NULL;
+        if (opt_value(argc, argv, "--default", &i, &value)) set_default = value;
+        else if (opt_value(argc, argv, "--remove", &i, &value)) remove = value;
         else die("profiles takes --default NAME or --remove NAME");
     }
 
@@ -2703,6 +2787,9 @@ static int usage(void) {
 int main(int argc, char **argv) {
     /* The askpass child is re-entered with the profile exported, so it answers
        with the same seed its parent used. */
+    /* one release for everything the arena lent us, on every exit path */
+    atexit(arena_reset);
+
     const char *env_profile = getenv("OATHPASS_PROFILE");
     if (env_profile && *env_profile) snprintf(g_profile, sizeof g_profile, "%s", env_profile);
 
@@ -2713,34 +2800,17 @@ int main(int argc, char **argv) {
     int forced_node = 0;
     int index = 1;
     while (index < argc) {
-        if (!strncmp(argv[index], "--port=", 7)) {
-            forced_port = atoi(argv[index] + 7);
-            index++;
+        const char *value = NULL;
+        if (opt_value(argc, argv, "--port", &index, &value)) {
+            forced_port = atoi(value);
             continue;
         }
-        if (!strcmp(argv[index], "--port") && index + 1 < argc) {
-            forced_port = atoi(argv[index + 1]);
-            index += 2;
+        if (opt_value(argc, argv, "--node", &index, &value)) {
+            forced_node = atoi(value);
             continue;
         }
-        if (!strncmp(argv[index], "--node=", 7)) {
-            forced_node = atoi(argv[index] + 7);
-            index++;
-            continue;
-        }
-        if (!strcmp(argv[index], "--node") && index + 1 < argc) {
-            forced_node = atoi(argv[index + 1]);
-            index += 2;
-            continue;
-        }
-        if (!strncmp(argv[index], "--profile=", 10)) {
-            snprintf(g_profile, sizeof g_profile, "%s", argv[index] + 10);
-            index++;
-            continue;
-        }
-        if (!strcmp(argv[index], "--profile") && index + 1 < argc) {
-            snprintf(g_profile, sizeof g_profile, "%s", argv[index + 1]);
-            index += 2;
+        if (opt_value(argc, argv, "--profile", &index, &value)) {
+            snprintf(g_profile, sizeof g_profile, "%s", value);
             continue;
         }
         break;
@@ -2762,11 +2832,16 @@ int main(int argc, char **argv) {
     if (!strcmp(command, "--init") || !strcmp(command, "init")) {
         int force = 0;
         const char *profile = g_profile[0] ? g_profile : NULL;
-        for (int i = 1; i < restc; i++) {
-            if (!strcmp(rest[i], "--force")) force = 1;
-            else if (!strncmp(rest[i], "--profile=", 10)) profile = rest[i] + 10;
-            else if (!strcmp(rest[i], "--profile") && i + 1 < restc) profile = rest[++i];
-            else die("init takes only --profile NAME and --force");
+        int i = 1;
+        while (i < restc) {
+            const char *value = NULL;
+            if (opt_flag(restc, rest, "--force", &i)) {
+                force = 1;
+            } else if (opt_value(restc, rest, "--profile", &i, &value)) {
+                profile = value;
+            } else {
+                die("init takes only --profile NAME and --force");
+            }
         }
         return cmd_init(profile, force);
     }

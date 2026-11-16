@@ -73,6 +73,15 @@ Never commit the built binary: `/oathpass` is ignored.
 
 ## Style
 
+- **Allocation goes through the arena** (`amalloc`, `astrdup`, `aprintf`,
+  `astrcat`) and is released once by `atexit(arena_reset)`.  No
+  `malloc`, `realloc`, `strdup` or `free` anywhere else — `leaks --atExit --
+  ./oathpass profiles` reports `0 leaks`, and that is the state to keep.  Paths,
+  targets and argv strings are built with `aprintf`, never with a fixed buffer
+  and `snprintf`: the two `-Wformat-truncation` failures CI ever reported came
+  from exactly that pattern.
+- Option parsing goes through `opt_value`/`opt_flag`, which accept `--name v`
+  and `--name=v`; do not hand-roll a parser again.
 - C builds warning-free under `-Wall -Wextra -Werror` with both clang and gcc.
 - No third-party dependency. SHA-1/256/512 and HMAC live in `src/oathpass.c`;
   `--selftest` pins them to the RFC 6238 vectors, so a crypto change that
