@@ -1563,10 +1563,7 @@ static int report_no_network(const Config *cfg, int forced_index, int forced_por
  */
 
 static void mkdir_p(const char *path) {
-    char tmp[CONTROL_PATH_MAX];
-    size_t len = strlen(path);
-    if (len >= sizeof tmp) die("path too long");
-    memcpy(tmp, path, len + 1);
+    char *tmp = astrdup(path); /* writable copy: the walk splits it in place */
     for (char *p = tmp + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
@@ -1628,19 +1625,15 @@ static int run_silent(char *const argv[]) {
 
 /* `ssh -O check` talks to the socket only, never to the network. */
 static int master_alive(const char *sock, int port, const Config *cfg) {
-    char target[600];
-    char portbuf[16];
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
-    snprintf(portbuf, sizeof portbuf, "%d", port);
+    char *target = aprintf("%s@%s", cfg->user, cfg->host);
+    char *portbuf = aprintf("%d", port);
     char *argv[] = {"ssh", "-O", "check", "-S", (char *)sock, "-p", portbuf, target, NULL};
     return run_silent(argv) == 0;
 }
 
 static int master_exit(const char *sock, int port, const Config *cfg) {
-    char target[600];
-    char portbuf[16];
-    snprintf(target, sizeof target, "%s@%s", cfg->user, cfg->host);
-    snprintf(portbuf, sizeof portbuf, "%d", port);
+    char *target = aprintf("%s@%s", cfg->user, cfg->host);
+    char *portbuf = aprintf("%d", port);
     char *argv[] = {"ssh", "-O", "exit", "-S", (char *)sock, "-p", portbuf, target, NULL};
     return run_silent(argv) == 0;
 }
@@ -2355,17 +2348,8 @@ static JVal *load_document(const char *path) {
 }
 
 static void store_document(const char *path, JVal *root) {
-    char dir[CONTROL_PATH_MAX];
-    size_t length = strlen(path);
-    if (length >= sizeof dir) die("path too long");
-    memcpy(dir, path, length + 1);
-    char *slash = strrchr(dir, '/');
-    if (slash) *slash = '\0';
-    mkdir_p(dir);
-    chmod(dir, 0700);
-
-    char temporary[CONTROL_PATH_MAX];
-    snprintf(temporary, sizeof temporary, "%s.tmp", path);
+    ensure_parent_dir(path);
+    const char *temporary = aprintf("%s.tmp", path);
     int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) die("cannot write %s: %s", temporary, strerror(errno));
     FILE *out = fdopen(fd, "w");
